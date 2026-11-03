@@ -62,6 +62,15 @@ MODULE_PARM_DESC(ae9_capture, "AE-9: expose capture streams on the MAIN codec (D
 static bool ae9_mic;
 module_param(ae9_mic, bool, 0444);
 MODULE_PARM_DESC(ae9_mic, "AE-9: initialise the DSP mic path (experimental, default 0)");
+
+/* Direct Mode: re-clock the DSP/I2S chain to the playback stream's rate
+ * instead of leaving it pinned at 96 kHz. 0 (default) keeps the current
+ * stable behaviour. 1 = follow the stream in pcm_prepare and restore 96 kHz
+ * on cleanup. Only the rates the I2S descriptors have values for are
+ * followed (44.1/48/88.2/96 kHz); anything else is left alone. */
+static bool ae9_direct;
+module_param(ae9_direct, bool, 0644);
+MODULE_PARM_DESC(ae9_direct, "AE-9: follow the playback stream rate on the DSP/I2S path (Direct Mode, experimental, default 0)");
 #include <asm/io.h>
 #include <sound/core.h>
 #include <sound/hda_codec.h>
@@ -4138,6 +4147,20 @@ static void r3di_gpio_dsp_status_set(struct hda_codec *codec,
  * PCM callbacks
  */
 static void ae9_dump_dsp_output_state(struct hda_codec *codec, const char *when);
+static void ae9_i2s_rate_set(struct hda_codec *codec, unsigned int rate);
+
+static int ca0132_playback_pcm_open(struct hda_pcm_stream *hinfo,
+				    struct hda_codec *codec,
+				    struct snd_pcm_substream *substream)
+{
+	struct ca0132_spec *spec = codec->spec;
+
+	/* Direct Mode follows the Windows stereo path: no 6-channel stream. */
+	if (ae9_direct && ca0132_quirk(spec) == QUIRK_AE9)
+		return snd_pcm_hw_constraint_minmax(substream->runtime,
+				SNDRV_PCM_HW_PARAM_CHANNELS, 2, 2);
+	return 0;
+}
 
 static int ca0132_playback_pcm_prepare(struct hda_pcm_stream *hinfo,
 			struct hda_codec *codec,
@@ -4146,6 +4169,10 @@ static int ca0132_playback_pcm_prepare(struct hda_pcm_stream *hinfo,
 			struct snd_pcm_substream *substream)
 {
 	struct ca0132_spec *spec = codec->spec;
+
+	if (ae9_direct && ca0132_quirk(spec) == QUIRK_AE9 &&
+	    spec->dsp_state == DSP_DOWNLOADED)
+		ae9_i2s_rate_set(codec, substream->runtime->rate);
 
 	snd_hda_codec_setup_stream(codec, spec->dacs[0], stream_tag, 0, format);
 
@@ -4175,6 +4202,10 @@ static int ca0132_playback_pcm_cleanup(struct hda_pcm_stream *hinfo,
 		msleep(50);
 
 	snd_hda_codec_cleanup_stream(codec, spec->dacs[0]);
+
+	if (ae9_direct && ca0132_quirk(spec) == QUIRK_AE9 &&
+	    spec->dsp_state == DSP_DOWNLOADED)
+		ae9_i2s_rate_set(codec, 96000);
 
 	return 0;
 }
@@ -7063,6 +7094,98 @@ static int ca0132_alt_add_svm_enum(struct hda_codec *codec)
 }
 
 /*
+ * AE-9 Direct Mode switch.
+ *
+ * The module parameter is the state; this control only flips it, so a user
+ * (or the GUI) can turn the rate following on and off without reloading the
+ * module.  It takes effect on the next PCM prepare.
+ */
+static int ae9_direct_ctl_info(struct snd_kcontrol *kcontrol,
+			       struct snd_ctl_elem_info *uinfo)
+{
+	uinfo->type = SNDRV_CTL_ELEM_TYPE_BOOLEAN;
+	uinfo->count = 1;
+	uinfo->value.integer.min = 0;
+	uinfo->value.integer.max = 1;
+	return 0;
+}
+
+static int ae9_direct_ctl_get(struct snd_kcontrol *kcontrol,
+			      struct snd_ctl_elem_value *ucontrol)
+{
+	ucontrol->value.integer.value[0] = ae9_direct ? 1 : 0;
+	return 0;
+}
+
+/*
+ * Force one mixer control to an integer/enum value.  Used to switch the SBX
+ * processors off when Direct Mode is enabled; the control's own put callback
+ * does the DSP work.
+ */
+static void ae9_set_ctl_value(struct hda_codec *codec, const char *name, int val)
+{
+	struct snd_kcontrol *kctl = snd_hda_find_mixer_ctl(codec, name);
+	struct snd_ctl_elem_info info = {};
+	struct snd_ctl_elem_value *uctl;
+
+	if (!kctl || !kctl->put)
+		return;
+	uctl = kzalloc(sizeof(*uctl), GFP_KERNEL);
+	if (!uctl)
+		return;
+	uctl->id = kctl->id;
+	if (kctl->get)
+		kctl->get(kctl, uctl);
+	if (kctl->info) {
+		info.id = kctl->id;
+		kctl->info(kctl, &info);
+		if (info.type == SNDRV_CTL_ELEM_TYPE_ENUMERATED)
+			uctl->value.enumerated.item[0] = val;
+		else
+			uctl->value.integer.value[0] = val;
+	}
+	if (kctl->put(kctl, uctl) >= 0)
+		snd_ctl_notify(codec->card, SNDRV_CTL_EVENT_MASK_VALUE,
+			       &kctl->id);
+	kfree(uctl);
+}
+
+static void ae9_direct_disable_effects(struct hda_codec *codec)
+{
+	ae9_set_ctl_value(codec, "Enable OutFX Playback Switch", 0);
+	ae9_set_ctl_value(codec, "Enable InFX Capture Switch", 0);
+}
+
+static int ae9_direct_ctl_put(struct snd_kcontrol *kcontrol,
+			      struct snd_ctl_elem_value *ucontrol)
+{
+	struct hda_codec *codec = snd_kcontrol_chip(kcontrol);
+	bool on = !!ucontrol->value.integer.value[0];
+
+	/* Direct Mode is the clean path: switch the DSP effects off when it is
+	 * enabled. This is not a hard lock -- the switches can be turned back
+	 * on, but the next enable of Direct Mode turns them off again. */
+	if (on && !ae9_direct)
+		ae9_direct_disable_effects(codec);
+	ae9_direct = on;
+	return 0;
+}
+
+static int ae9_add_direct_ctl(struct hda_codec *codec)
+{
+	struct snd_kcontrol_new knew = {
+		.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
+		.name = "AE-9 Direct Mode",
+		.access = SNDRV_CTL_ELEM_ACCESS_READWRITE,
+		.info = ae9_direct_ctl_info,
+		.get = ae9_direct_ctl_get,
+		.put = ae9_direct_ctl_put,
+	};
+
+	return snd_ctl_add(codec->card, snd_ctl_new1(&knew, codec));
+}
+
+/*
  * Create an Output Select enumerated control for codecs with surround
  * out capabilities.
  */
@@ -7467,6 +7590,11 @@ static int ca0132_build_controls(struct hda_codec *codec)
 		err = ca0132_alt_add_output_enum(codec);
 		if (err < 0)
 			return err;
+		if (ca0132_quirk(spec) == QUIRK_AE9) {
+			err = ae9_add_direct_ctl(codec);
+			if (err < 0)
+				return err;
+		}
 		err = ca0132_alt_add_speaker_channel_cfg_enum(codec);
 		if (err < 0)
 			return err;
@@ -7576,6 +7704,7 @@ static const struct hda_pcm_stream ca0132_pcm_analog_playback = {
 	.channels_min = 2,
 	.channels_max = 6,
 	.ops = {
+		.open = ca0132_playback_pcm_open,
 		.prepare = ca0132_playback_pcm_prepare,
 		.cleanup = ca0132_playback_pcm_cleanup,
 		.get_delay = ca0132_playback_pcm_delay,
@@ -7641,6 +7770,20 @@ static int ca0132_build_pcms(struct hda_codec *codec)
 	info->stream[SNDRV_PCM_STREAM_PLAYBACK].nid = spec->dacs[0];
 	info->stream[SNDRV_PCM_STREAM_PLAYBACK].channels_max =
 		spec->multiout.max_channels;
+	/*
+	 * The AE-9's analog converter (NID 0x02) declares only 96 kHz, but the
+	 * DSP/I2S chain has a 192 kHz descriptor (Windows Direct Mode uses it).
+	 * set_pcm_default_values() keeps a non-zero rates mask, so this extends
+	 * the PCM without patching snd-hda-codec. It is always exposed: with
+	 * AE-9 Direct Mode off the DSP still resamples, but the stream no longer
+	 * needs a module reload when the switch is flipped. 176.4 kHz is
+	 * deliberately left out: neither candidate rate code produced audio.
+	 */
+	if (ca0132_quirk(spec) == QUIRK_AE9)
+		info->stream[SNDRV_PCM_STREAM_PLAYBACK].rates =
+			SNDRV_PCM_RATE_44100 | SNDRV_PCM_RATE_48000 |
+			SNDRV_PCM_RATE_88200 | SNDRV_PCM_RATE_96000 |
+			SNDRV_PCM_RATE_192000;
 	if (ae9_capture_blocked(codec)) {
 		codec_info(codec, "AE-9: capture streams not created (ae9_capture=0)\n");
 		goto digital;
@@ -8820,6 +8963,71 @@ static void ae9_pll_set(struct hda_codec *codec)
 
 	for (i = 0; i < ARRAY_SIZE(addr); i++)
 		chipio_8051_write_pll_pmu(codec, addr[i], data[i]);
+}
+
+/*
+ * Direct Mode: per-rate I2S/HCI descriptors, decoded from CtxHda's I2SM Start
+ * (0x33bac).  See docs/reverse-engineering/ctxhda-acm-analysis.md §10.5 and
+ * §11.2.  The rate code goes to BAR2[0x100] bits 31:29 (HdIs rate method):
+ * 48k=0, 44.1k=1, 96k=2, 88.2k=3, 192k=4.
+ */
+struct ae9_i2s_rate {
+	unsigned int rate;
+	unsigned int hci;	/* 0x189000/4/8 */
+	unsigned int hci2;	/* 0x189024 */
+	unsigned int code;	/* BAR2[0x100] bits 31:29 */
+	enum ca0132_sample_rate sr;
+};
+
+static const struct ae9_i2s_rate ae9_i2s_rates[] = {
+	{ 44100, 0x0001f100, 0x00008005, 1, SR_44_100 },
+	{ 48000, 0x0001f100, 0x00008005, 0, SR_48_000 },
+	{ 88200, 0x0001f101, 0x00014004, 3, SR_88_200 },
+	{ 96000, 0x0001f101, 0x00014004, 2, SR_96_000 },
+	{ 192000, 0x0001f102, 0x00022003, 4, SR_192_000 },
+};
+
+static void ae9_i2s_rate_set(struct hda_codec *codec, unsigned int rate)
+{
+	struct ca0132_spec *spec = codec->spec;
+	const struct ae9_i2s_rate *r = NULL;
+	unsigned int v;
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(ae9_i2s_rates); i++) {
+		if (ae9_i2s_rates[i].rate == rate) {
+			r = &ae9_i2s_rates[i];
+			break;
+		}
+	}
+	if (!r)
+		return;
+
+	/* Windows' rate change (I2SM Start step 8): ASI setup, trimmed PLL,
+	 * descriptors, DAC mode, rate code, full PLL, ASI on. */
+	chipio_set_control_param(codec, CONTROL_PARAM_ASI, 8);
+	chipio_8051_write_pll_pmu(codec, 0x40, 0xc7);
+	chipio_8051_write_pll_pmu(codec, 0x42, 0xcd);
+	chipio_8051_write_pll_pmu(codec, 0x41, 0xce);
+	chipio_set_conn_rate(codec, 0x70, r->sr);
+	chipio_set_conn_rate(codec, 0xd0, r->sr);
+	chipio_write(codec, 0x189000, r->hci);
+	chipio_write(codec, 0x189004, r->hci);
+	chipio_write(codec, 0x189008, r->hci);
+	chipio_write(codec, 0x189024, r->hci2);
+	chipio_write(codec, 0x189028, 0x0002000f);
+	ae9_dac_write(codec, 0x01, 0xc0);	/* ES9038 input: 32-bit I2S */
+	ae9_dac_write(codec, 0x0a, 0x02);
+
+	v = readl(spec->mem_base + 0x100);
+	ca0113_mmio_writel(spec, 0x100,
+			   (v & 0x1fffffff) | (r->code << 29));
+
+	ae9_pll_set(codec);
+	chipio_set_control_param(codec, CONTROL_PARAM_ASI, 0xf);
+
+	codec_info(codec, "AE-9 direct: stream %u Hz (i2s 0x%06x/0x%05x, code %u)\n",
+		   rate, r->hci, r->hci2, r->code);
 }
 
 /* D0.3: I2SM Start - the AE-9's ASI / PLL / stream setup (96 kHz, 32-bit, 6 ch) */
