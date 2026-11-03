@@ -1,0 +1,36 @@
+name: Sync from DarkNikGr
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-darknikgr-main
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out your fork
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ github.token }}
+      - name: Merge DarkNikGr main
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add darknikgr https://github.com/DarkNikGr/sb-ae9.git
+          git fetch --no-tags darknikgr main
+          if git merge-base --is-ancestor darknikgr/main HEAD; then
+            echo "Already contains DarkNikGr/main at $(git rev-parse darknikgr/main)"
+            exit 0
+          fi
+          git merge --no-ff --no-edit darknikgr/main
+          git push origin HEAD:main
