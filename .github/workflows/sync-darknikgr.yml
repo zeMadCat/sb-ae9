@@ -32,5 +32,50 @@ jobs:
             echo "Already contains DarkNikGr/main at $(git rev-parse darknikgr/main)"
             exit 0
           fi
-          git merge --no-ff --no-edit darknikgr/main
+
+          # GITHUB_TOKEN cannot write files under .github/workflows. Merge source
+          # code, while retaining this fork's workflow files so the sync can push.
+          merge_status=0
+          if git merge --no-ff --no-edit --no-commit darknikgr/main; then
+            :
+          else
+            merge_status=$?
+          fi
+
+          conflicts="$(git diff --name-only --diff-filter=U)"
+          if [[ -n "$conflicts" ]]; then
+            while IFS= read -r path; do
+              case "$path" in
+                .github/workflows/*)
+                  if git cat-file -e "HEAD:$path" 2>/dev/null; then
+                    git checkout HEAD -- "$path"
+                  else
+                    git rm -f -- "$path"
+                  fi
+                  echo "Preserved fork workflow file: $path"
+                  ;;
+                *)
+                  echo "Merge conflict outside workflow files: $path" >&2
+                  exit 1
+                  ;;
+              esac
+            done <<< "$conflicts"
+          elif [[ "$merge_status" != 0 ]]; then
+            echo "Merge failed without a workflow-only conflict." >&2
+            exit "$merge_status"
+          fi
+
+          workflow_changes="$(git diff --cached --name-only -- .github/workflows/)"
+          if [[ -n "$workflow_changes" ]]; then
+            while IFS= read -r path; do
+              if git cat-file -e "HEAD:$path" 2>/dev/null; then
+                git checkout HEAD -- "$path"
+              else
+                git rm -f -- "$path"
+              fi
+              echo "Preserved fork workflow file: $path"
+            done <<< "$workflow_changes"
+          fi
+
+          git commit --no-edit
           git push origin HEAD:main
