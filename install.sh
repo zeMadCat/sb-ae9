@@ -50,8 +50,14 @@ install -m 644 "$SRC/install/sb-ae9.conf" /etc/modprobe.d/sb-ae9.conf
 rm -f "$home/.config/wireplumber/main.lua.d/51-ae9-soft-mixer.lua" \
       "$home/.config/wireplumber/wireplumber.conf.d/51-ae9-soft-mixer.conf" \
       "$home/.config/wireplumber/wireplumber.conf.d/51-ae9-soft-mixer.conf.disabled"
-install -D -m 644 "$SRC/install/20-ae9-inputs.conf" "$home/.config/pipewire/pipewire.conf.d/20-ae9-inputs.conf"
-chown "$usr:" "$home/.config/pipewire/pipewire.conf.d/20-ae9-inputs.conf"
+inputs_conf="$home/.config/pipewire/pipewire.conf.d/20-ae9-inputs.conf"
+if [ -f "$inputs_conf" ] && [ "${AE9_RESET_CONFIGS:-0}" != 1 ]; then
+  # The Input page stores per-input rates/formats in this file; keep them.
+  echo "keeping existing $inputs_conf (set AE9_RESET_CONFIGS=1 to replace)"
+else
+  install -D -m 644 "$SRC/install/20-ae9-inputs.conf" "$inputs_conf"
+fi
+chown "$usr:" "$inputs_conf"
 install -D -m 644 "$SRC/install/30-ae9-names.conf" "$home/.config/wireplumber/wireplumber.conf.d/30-ae9-names.conf"
 chown "$usr:" "$home/.config/wireplumber/wireplumber.conf.d/30-ae9-names.conf"
 install -D -m 644 "$SRC/install/90-sb-ae9-name.rules" /etc/udev/rules.d/90-sb-ae9-name.rules
@@ -65,10 +71,14 @@ install -D -m 755 "$SRC/install/ae9-resume.sh" /usr/local/libexec/sb-ae9/ae9-res
 install -D -m 755 "$SRC/install/ae9-resume-sleep" /usr/lib/systemd/system-sleep/50-ae9-resume
 install -D -m 755 "$SRC/install/ae9-unmute.sh" /usr/local/libexec/sb-ae9/ae9-unmute.sh
 install -D -m 644 "$SRC/install/ae9-unmute.service" "$home/.config/systemd/user/ae9-unmute.service"
+install -D -m 755 "$SRC/install/ae9-profile-sync.sh" /usr/local/libexec/sb-ae9/ae9-profile-sync.sh
+install -D -m 644 "$SRC/install/ae9-profile-sync.service" "$home/.config/systemd/user/ae9-profile-sync.service"
 chown -R "$usr:" "$home/.config/systemd"
 sudo -u "$usr" XDG_RUNTIME_DIR="/run/user/$uid" systemctl --user daemon-reload 2>/dev/null || true
 sudo -u "$usr" XDG_RUNTIME_DIR="/run/user/$uid" systemctl --user enable ae9-defaults.service 2>/dev/null || true
 sudo -u "$usr" XDG_RUNTIME_DIR="/run/user/$uid" systemctl --user enable ae9-unmute.service 2>/dev/null || true
+sudo -u "$usr" XDG_RUNTIME_DIR="/run/user/$uid" systemctl --user enable ae9-profile-sync.service 2>/dev/null || true
+sudo -u "$usr" XDG_RUNTIME_DIR="/run/user/$uid" systemctl --user restart ae9-profile-sync.service 2>/dev/null || true
 
 # The GUI is part of the driver: always replace the per-user copy so a
 # stale control list cannot keep the window from opening after an update.
