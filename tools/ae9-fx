@@ -91,6 +91,16 @@ def find_numid(name):
     raise RuntimeError(f"control not found: {name}")
 
 
+def has_ctl(name):
+    """True when the card exposes this control (the AE-9 has no software
+    headphone gain: the 3-position switch on the ACM owns it)."""
+    try:
+        find_numid(name)
+        return True
+    except RuntimeError:
+        return False
+
+
 def read_numid(name):
     """Fallback reader for capture controls: sget fails while PipeWire owns
     the capture device, but cget on the card always works."""
@@ -143,7 +153,19 @@ def read(name):
     return st
 
 
+# A simple control that combines a capture volume and a switch (Capture,
+# What U Hear) rejects `sset <name> on|off`; the raw switch has a different
+# name, so go straight to its numid.
+CAPTURE_SWITCHES = {
+    "Capture": "Capture Switch",
+    "What U Hear": "What U Hear Capture Switch",
+}
+
+
 def apply_ctl(name, value):
+    if value in ("on", "off") and name in CAPTURE_SWITCHES:
+        amixer("cset", f"numid={find_numid(CAPTURE_SWITCHES[name])}", value)
+        return
     try:
         amixer("sset", name, str(value))
     except RuntimeError:
@@ -204,6 +226,33 @@ def find_sink():
     return None
 
 
+def sink_playback_streams(node):
+    """True if a playback stream (not just a monitor) is linked to the sink."""
+    try:
+        p = subprocess.run(["pw-dump"], capture_output=True, text=True)
+        data = json.loads(p.stdout or "[]")
+    except (OSError, ValueError):
+        return False
+    nodes = {o.get("id"): o.get("info", {}).get("props", {}) for o in data}
+    for o in data:
+        props = o.get("info", {}).get("props", {})
+        if props.get("link.input.node") != node:
+            continue
+        src = props.get("link.output.node")
+        src_props = nodes.get(src, {})
+        if not str(src_props.get("media.class", "")).startswith("Stream/Output/Audio"):
+            continue
+        # A paused player keeps the link; only a running stream is playback.
+        try:
+            info = subprocess.run(["pw-cli", "info", str(src)],
+                                  capture_output=True, text=True).stdout
+        except OSError:
+            return False
+        if 'state: "running"' in info:
+            return True
+    return False
+
+
 def sink_format(node):
     """(format, channels, rate) the sink is running right now."""
     out = _pw("enum-params", str(node), "Format")
@@ -261,6 +310,21 @@ def allowed_rates():
 def graph_rate():
     m = re.search(r"\d+", _setting("clock.rate") or "")
     return int(m.group(0)) if m else None
+
+
+def forced_rate():
+    m = re.search(r"\d+", _setting("clock.force-rate") or "")
+    return int(m.group(0)) if m else 0
+
+
+def apply_force_rate(rate):
+    """Force the graph rate (0 = follow the streams)."""
+    p = subprocess.run(["pw-metadata", "-n", "settings", "0",
+                        "clock.force-rate", str(rate)],
+                       capture_output=True, text=True)
+    if p.returncode != 0:
+        lines = (p.stderr or p.stdout).strip().splitlines()
+        raise RuntimeError(lines[-1] if lines else "pw-metadata failed")
 
 
 def apply_allowed_rates(rates):
@@ -330,16 +394,16 @@ def mixer_state():
         ctl = ("AE-9 Output" if "'AE-9 Output'" in amixer("scontrols")
                else "Output Select")
         route = read(ctl)["item"] or "Headphone"
-        master = read("Master")["value"] or 18
+        master = read("Master")["value"] or 65
         outfx = bool(read("Enable OutFX")["switch"])
     except RuntimeError:
-        return "AE-9 Output", "Headphone", 18, False
+        return "AE-9 Output", "Headphone", 65, False
     return ctl, route, master, outfx
 
 
 def restore_routing(ctl, route, master, outfx):
-    """Undo WirePlumber's route restore, which mutes Front and moves the knob."""
-    for c in ("PCM", "Front", "Surround"):
+    """Undo WirePlumber's route restore, which can mute the shared output."""
+    for c in ("PCM", "Headphone+LO", "Surround"):
         try:
             amixer("sset", c, "unmute")   # PCM is volume-only: no switch
         except RuntimeError:
@@ -402,7 +466,7 @@ PROCESSORS = [
 
 # The manufacturer's levels, for the reset button.
 DEFAULTS = {
-    "Master": 18,
+    "Master": 65,
     "AE-9 Output": "Headphone",
     "Enable OutFX": "on",
     "FX: Crystalizer": ("on", 65),
@@ -586,22 +650,22 @@ class Win(Adw.ApplicationWindow):
                         "On = sound, off = mute (a short press on the knob)")
 
         self.add_scale(
-            g, None, "Master", "Level (0–99)", 0, 99, marks=(18, 44, 99))
+            g, None, "Master", "Level (0–90)", 0, 90, marks=(65, 72, 90))
         g.add(Adw.ActionRow(
-            title="99 = 0 dB · 44 ≈ −12 dB · 18 ≈ −25 dB · default 18"))
+            title="90 = 0 dB · 72 ≈ −18 dB · 65 ≈ −25 dB · default 65"))
         page.add(g)
 
         g2 = Adw.PreferencesGroup(title="Please note")
         self.add_note(
             g2,
-            "PipeWire's slider is software gain. Keep it at 100% and set the "
-            "level here — otherwise you lose resolution before the signal "
-            "reaches the DSP.")
+            "PipeWire's slider drives the same hardware Master (soft-mixer is "
+            "off), so the desktop slider, the knob and the ACM display all "
+            "show the same level.")
         self.add_note(
             g2,
-            "The ae9-defaults service puts Master back to 18 at every login. "
-            "For another default: systemctl --user edit ae9-defaults → "
-            "Environment=AE9_LEVEL=30")
+            "The ae9-defaults service puts Master back to 65 (-25 dB) at every "
+            "login. For another default: systemctl --user edit ae9-defaults → "
+            "Environment=AE9_LEVEL=72")
         page.add(g2)
 
         g3 = Adw.PreferencesGroup(title="Status")
@@ -621,6 +685,10 @@ class Win(Adw.ApplicationWindow):
         self.add_combo(g, None, "AE-9 Output", "What you hear",
                        "Same as holding the knob for 1.5–3 s")
         self.add_switch(g, "HP/Speaker Auto Detect", "Headphone auto-detect")
+        self.add_note(
+            g,
+            "Auto-detect follows the ACM 3.5 mm jack. The ACM firmware does "
+            "not report the 6.35 mm jack, so switch the output by hand for it.")
         page.add(g)
 
         g2 = Adw.PreferencesGroup(
@@ -648,6 +716,27 @@ class Win(Adw.ApplicationWindow):
             "The ACM's own HP/SP selector is read-only to the driver; the "
             "driver writes the amp bit and the ES9038 front mute instead.")
         page.add(g3)
+
+        g4 = Adw.PreferencesGroup(
+            title="S/PDIF (optical)",
+            description="Digital output and input on the card bracket "
+                        "(playback and capture device 10)")
+        self.add_switch(g4, "IEC958 Playback Switch", "S/PDIF output",
+                        "Send the digital output to the optical port")
+        self.add_switch(g4, "IEC958 Capture Switch", "S/PDIF input",
+                        "Receive the optical input as capture device 10")
+        self.add_note(
+            g4,
+            "Tested with an optical cable from the output back to the input "
+            "at 44.1 / 48 / 88.2 / 96 / 192 kHz. The DSP stays in the path, "
+            "so the loopback is clean but not sample-exact. 176.4 kHz is not "
+            "advertised by the digital converter. For playback pick the "
+            "'Sound Blaster AE-9 Optical S/PDIF' sink; the ACP digital "
+            "profile's sink uses the other PCM and is silent at the optical "
+            "port. The input is the 'Sound Blaster AE-9 S/PDIF' PipeWire "
+            "source. The optical link is stereo PCM; 5.1 is available on the "
+            "analog line-out, not over S/PDIF.")
+        page.add(g4)
 
     def page_format(self, page):
         g = Adw.PreferencesGroup(title="Running")
@@ -711,6 +800,21 @@ class Win(Adw.ApplicationWindow):
             self.rate_rows[r] = row
         page.add(g2)
 
+        gf = Adw.PreferencesGroup(
+            title="Graph rate",
+            description="Capture sources follow the graph rate. Auto follows "
+                        "the playing stream; choose a rate to force it (for "
+                        "example when recording at 96 kHz with nothing playing).")
+        self.force_rates = [0, 44100, 48000, 88200, 96000, 192000]
+        self.force_combo = Adw.ComboRow(
+            title="Force rate",
+            model=Gtk.StringList.new(
+                ["Auto (follow streams)"] +
+                [f"{r} Hz" for r in self.force_rates[1:]]))
+        self.force_combo.connect("notify::selected", self.on_force_rate)
+        gf.add(self.force_combo)
+        page.add(gf)
+
         g3 = Adw.PreferencesGroup(title="Limits")
         self.add_note(
             g3,
@@ -734,8 +838,8 @@ class Win(Adw.ApplicationWindow):
         self.add_note(
             gr,
             "Audio stops for a few seconds. The AE-9 routing and level are "
-            "restored afterwards: WirePlumber's route restore can mute Front "
-            "and move the ACM knob.")
+            "restored afterwards: WirePlumber's route restore can mute the "
+            "shared output and move the ACM knob.")
         page.add(gr)
 
     def page_fx(self, page):
@@ -782,23 +886,24 @@ class Win(Adw.ApplicationWindow):
     def page_dac(self, page):
         g = Adw.PreferencesGroup(title="DAC filters")
         self.add_combo(g, None, "AE-5: Sound Filter", "Oversampling filter")
-        self.add_combo(g, None, "AE-5: Headphone Gain", "Headphone gain",
-                       "DAC master trim, not the analog IEM/Normal/High stage")
+        if has_ctl("AE-5: Headphone Gain"):
+            self.add_combo(g, None, "AE-5: Headphone Gain", "Headphone gain",
+                           "DAC master trim (AE-5/AE-7 only)")
         page.add(g)
 
-        g2 = Adw.PreferencesGroup(title="About the gain control")
+        g2 = Adw.PreferencesGroup(title="Headphone gain")
+        self.add_note(
+            g2,
+            "On the AE-9 the IEM / N / HIGH gain is the 3-position switch on "
+            "the ACM. It is an analog stage and the driver cannot change it. "
+            "The ES9038Q2M trims stay at 0 dB, so leave the switch at the "
+            "position that matches your headphones and use Master for level.",
+            "audio-headphones-symbolic")
         self.add_note(
             g2,
             "Capture is on its own page now: the ACM microphone (device 0) and "
             "the rear line-in (device 4) work.",
             "dialog-information-symbolic")
-        self.add_note(
-            g2,
-            "Headphone Gain writes the ES9038Q2M master-trim registers. "
-            "Confirmed on the AE-9: Low is audibly quieter than High. It is a "
-            "digital level, not the analog IEM/Normal/High amp stage. With "
-            "sensitive IEMs start at Low. If nothing changes, the driver did "
-            "not apply it.")
         page.add(g2)
 
     def page_capture(self, page):
@@ -809,6 +914,26 @@ class Win(Adw.ApplicationWindow):
         self.add_combo(g, None, "Input Source", "ACM input",
                        "Microphone / Line In")
         page.add(g)
+
+        glevel = Adw.PreferencesGroup(
+            title="Levels",
+            description="Capture amp in 1 dB steps: 90 = 0 dB, 99 = +9 dB")
+        self.add_switch(glevel, "Capture", "Capture",
+                        "Input capture switch for the selected source")
+        self.add_scale(glevel, None, "Capture", "Capture level (0–99)",
+                       0, 99, marks=(90,))
+        self.add_combo(glevel, None, "Mic Boost", "Mic boost",
+                       "Analogue preamp for the ACM microphone")
+        page.add(glevel)
+
+        gwu = Adw.PreferencesGroup(
+            title="Loopback",
+            description="The DSP output, recorded as a capture source")
+        self.add_switch(gwu, "What U Hear", "What U Hear",
+                        "Record what the card is playing")
+        self.add_scale(gwu, None, "What U Hear", "Loopback level (0–99)",
+                       0, 99, marks=(90,))
+        page.add(gwu)
 
         gfx = Adw.PreferencesGroup(
             title="CrystalVoice / input effects",
@@ -852,10 +977,10 @@ class Win(Adw.ApplicationWindow):
             "recording channels.")
         self.add_note(
             g2,
-            "Capture volume and mic boost stay under PipeWire/GNOME: the "
-            "simple mixer lookup returns an error while PipeWire owns the "
-            "capture device. Use GNOME's Sound panel, or "
-            "amixer -c Creative cset numid=9 90,90 for the capture level.")
+            "The Levels above are the card's hardware capture amp. PipeWire "
+            "and GNOME put their own software source volume on top; the "
+            "hardware level is the one that changes the analogue gain, and "
+            "Mic boost adds 10, 20 or 30 dB ahead of it.")
         page.add(g2)
 
     # ── handlers ──────────────────────────────────────────────────────────────
@@ -923,6 +1048,21 @@ class Win(Adw.ApplicationWindow):
         self.reload()
         return False
 
+    def on_force_rate(self, row, _param):
+        if self.loading:
+            return
+        idx = row.get_selected()
+        if idx < 0 or idx >= len(self.force_rates):
+            return
+        try:
+            apply_force_rate(self.force_rates[idx])
+        except (RuntimeError, OSError) as exc:
+            self.toast(f"graph rate: {exc}")
+            return
+        rate = self.force_rates[idx]
+        self.toast("Graph rate: auto" if rate == 0 else f"Graph rate: {rate} Hz")
+        self.refresh_format()
+
     def on_rate(self, row, _param, rate):
         if self.loading:
             return
@@ -985,7 +1125,9 @@ class Win(Adw.ApplicationWindow):
         except (RuntimeError, OSError):
             return
         self.format_row.set_subtitle(
-            f"{fmt} · {ch} ch · {rate} Hz" if fmt else "idle (device suspended)")
+            f"{fmt} · {ch} ch · {rate} Hz" if fmt and sink_playback_streams(node)
+            else f"held at {rate} Hz (no active stream)" if fmt
+            else "idle (device suspended)")
         allowed = " ".join(str(r) for r in rates) or "—"
         self.clock_row.set_subtitle(f"{clock or '—'} Hz · allowed: {allowed}")
 
@@ -1030,6 +1172,10 @@ class Win(Adw.ApplicationWindow):
             for r, row in self.rate_rows.items():
                 row.set_active(r in allowed)
 
+            fr = forced_rate()
+            self.force_combo.set_selected(
+                self.force_rates.index(fr) if fr in self.force_rates else 0)
+
             fmt = saved_format()
             values = [v for _label, v in FORMATS]
             if fmt in values:
@@ -1063,17 +1209,21 @@ def selftest():
     """Check the parsers without opening a window."""
     print(f"card: {CARD}")
     names = [p[0] for p in PROCESSORS] + [
-        "Master", "AE-9 Output", "HP/Speaker Auto Detect", "Enable OutFX",
+        "Master", "Headphone+LO", "AE-9 Output", "HP/Speaker Auto Detect",
+        "Enable OutFX",
         "Surround Channel Config", "Full-Range Front Speakers",
         "Full-Range Rear Speakers", "Bass Redirection",
         "Bass Redirection Crossover", "AE-5: Sound Filter",
-        "AE-5: Headphone Gain", "FX: Smart Volume Setting",
+        "FX: Smart Volume Setting",
         "FX: X-Bass Crossover", "FX: Equalizer Preset", "EQ Band0",
         "Input Source", "Enable InFX Capture Switch",
         "FX: Voice Focus Capture Switch", "FX: Noise Reduction Capture Switch",
         "FX: Mic SVM Capture Switch", "SVM Level Capture Volume",
-        "VoiceFX Capture Switch",
+        "VoiceFX Capture Switch", "Capture", "Mic Boost", "What U Hear",
+        "IEC958 Playback Switch", "IEC958 Capture Switch",
     ]
+    if has_ctl("AE-5: Headphone Gain"):
+        names.append("AE-5: Headphone Gain")
     for n in names:
         try:
             st = read(n)

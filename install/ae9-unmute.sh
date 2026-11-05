@@ -1,5 +1,5 @@
 #!/bin/sh
-# Re-assert the Sound Blaster AE-9's "Front Playback Switch" after
+# Re-assert the Sound Blaster AE-9's "Headphone+LO Playback Switch" after
 # PipeWire/WirePlumber starts.
 #
 # WirePlumber's route restore can leave that switch off when the graph comes
@@ -10,6 +10,10 @@
 # Installed by install.sh as /usr/local/libexec/sb-ae9/ae9-unmute.sh and run
 # from the user unit ae9-unmute.service (WantedBy=pipewire.service).
 
+# A PipeWire restart stops this unit while the loop below is sleeping.  Exit 0
+# on that signal so the journal does not report a failed service.
+trap 'exit 0' TERM INT
+
 for d in /proc/asound/card*/; do
 	[ -r "$d/codec#1" ] || continue
 	grep -qs 'Sound Blaster AE-9' "$d/codec#1" || continue
@@ -19,7 +23,7 @@ for d in /proc/asound/card*/; do
 	for _ in 1 2 3 4 5 6; do
 		sleep 1
 		id=$(amixer -c "$idx" controls 2>/dev/null |
-		     sed -n "s/^numid=\([0-9]*\).*name='Front Playback Switch'/\1/p" |
+		     sed -n "s/^numid=\([0-9]*\).*name='Headphone+LO Playback Switch'/\1/p" |
 		     head -n1)
 		[ -n "$id" ] || continue
 		if ! amixer -c "$idx" cget numid="$id" 2>/dev/null | grep -q 'values=on'; then

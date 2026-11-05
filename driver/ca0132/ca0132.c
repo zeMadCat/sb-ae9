@@ -20,6 +20,9 @@
 #include <linux/io.h>
 #include <linux/pci.h>
 #include <linux/pm_runtime.h>
+#include <linux/ktime.h>
+#include <linux/jiffies.h>
+#include <linux/spinlock.h>
 
 /* AE-9 ACM service mode. 0 (default) = initialise the module once (unlock,
  * headphone amp on, display) and then leave it alone: no keepalive, no knob
@@ -1193,7 +1196,19 @@ struct ca0132_spec {
 	struct delayed_work unsol_hp_work;
 	struct delayed_work ae9_dump_work;	/* AE-9: mid-playback DSP/DAC dump */
 	struct delayed_work ae9_acm_work;	/* AE-9: 500 ms ACM service (keepalive, knob, display) */
+	spinlock_t ae9_acm_work_lock;
+	bool ae9_acm_active;
+	bool ae9_acm_removing;
+	bool ae9_acm_busy;
+	bool ae9_acm_ui_only;
+	bool ae9_acm_ui_pending;
+	unsigned long ae9_acm_service_due;
+	unsigned long ae9_acm_ui_due;
+	unsigned long ae9_acm_quiet_until;
+	unsigned int ae9_acm_refresh_log_left;
 	bool ae9_acm_present;
+	unsigned int ae9_acm_display_tx_left; /* diagnostic log budget */
+	bool ae9_acm_display_tx_failed; /* stop the display trial after failure */
 	unsigned int ae9_acm_fw;
 	int ae9_acm_tick;
 	int ae9_acm_show_mode_ticks;	/* >0: "-HP-"/"-SP-" on the display, then revert to volume */
@@ -1204,8 +1219,13 @@ struct ca0132_spec {
 	bool ae9_pm_held;		/* runtime-PM reference held: codec stays in D0 */
 	int ae9_knob_acc;		/* encoder detents not yet turned into volume points */
 	int ae9_knob_dir;		/* last encoder direction seen (Windows: board+0x288) */
-	bool ae9_dsp_vol_zeroed;	/* DSP output volume parked at 0 dB (curve lives on the amp) */
+	bool ae9_dsp_vol_zeroed;	/* DSP at 0 dB; output gain lives on the amp */
 	bool ae9_acm_regs_logged;	/* first periodic ACM register check logged */
+	bool ae9_acm_knob_tx_failed;	/* knob query TX broke: stop until reload */
+	bool ae9_acm_button_tx_failed;	/* button query TX broke: stop until reload */
+	bool ae9_hp_jack_valid;		/* physical headphone state sampled */
+	bool ae9_hp_jack_present;	/* ACM reg2 bit5 is active low */
+	struct mutex ae9_output_mutex;	/* output selection and ACM mode */
 	int ae9_acm_dead_ticks;		/* consecutive keepalive probes unanswered */
 	int ae9_acm_sel;		/* module's own output selector bits last seen (items 5/6) */
 
@@ -1263,6 +1283,8 @@ enum {
 #define ca0132_use_pci_mmio(spec)	({ (void)(spec); false; })
 #define ca0132_use_alt_controls(spec)	({ (void)(spec); false; })
 #endif
+
+static void ae9_acm_display_changed(struct ca0132_spec *spec);
 
 static const struct hda_pintbl alienware_pincfgs[] = {
 	{ 0x0b, 0x90170110 }, /* Builtin Speaker */
@@ -5001,18 +5023,26 @@ static int ca0132_alt_select_out_quirk_set(struct hda_codec *codec)
 	}
 
 	if (quirk_data->has_headphone_gain) {
-		if (spec->cur_out_type != HEADPHONE_OUT) {
-			if (quirk_data->is_ae_series)
+		if (quirk_data->is_ae_series) {
+			/*
+			 * The AE-9 selects its headphone gain with the
+			 * 3-position IEM/Normal/High switch on the ACM; the
+			 * host side has no control over that stage.  Windows
+			 * keeps the ES9038 front-channel trims at 0 dB on
+			 * this card, so do the same and never attenuate the
+			 * DAC on top of the hardware switch.
+			 */
+			if (ca0132_quirk(spec) == QUIRK_AE9)
+				ae5_headphone_gain_set(codec, 2);
+			else if (spec->cur_out_type != HEADPHONE_OUT)
 				ae5_headphone_gain_set(codec, 2);
 			else
-				zxr_headphone_gain_set(codec, 0);
-		} else {
-			if (quirk_data->is_ae_series)
 				ae5_headphone_gain_set(codec,
 						spec->ae5_headphone_gain_val);
-			else
-				zxr_headphone_gain_set(codec,
-						spec->zxr_gain_set);
+		} else {
+			zxr_headphone_gain_set(codec,
+					spec->cur_out_type == HEADPHONE_OUT ?
+					spec->zxr_gain_set : 0);
 		}
 	}
 
@@ -5040,7 +5070,7 @@ static void ca0132_set_out_node_pincfg(struct hda_codec *codec, hda_nid_t nid,
  * will detect either headphone or lineout(SPEAKER_OUT) from jack detection.
  * It also adds the ability to auto-detect the front headphone port.
  */
-static int ca0132_alt_select_out(struct hda_codec *codec)
+static int __ca0132_alt_select_out(struct hda_codec *codec)
 {
 	struct ca0132_spec *spec = codec->spec;
 	unsigned int tmp, outfx_set;
@@ -5062,13 +5092,24 @@ static int ca0132_alt_select_out(struct hda_codec *codec)
 	 * hp/speaker auto detect is enabled.
 	 */
 	if (auto_jack) {
-		jack_present = snd_hda_jack_detect(codec, spec->unsol_tag_hp) ||
-			   snd_hda_jack_detect(codec, spec->unsol_tag_front_hp);
+		if (ca0132_quirk(spec) == QUIRK_AE9) {
+			/* AE-9: the physical jacks are on the ACM and the codec
+			 * pins are pinned to NO_PRESENCE, so use the ACM sample.
+			 * Until the first sample, keep the current selection. */
+			if (spec->ae9_hp_jack_valid)
+				spec->cur_out_type = spec->ae9_hp_jack_present ?
+						     HEADPHONE_OUT : SPEAKER_OUT;
+			else
+				spec->cur_out_type = spec->out_enum_val;
+		} else {
+			jack_present = snd_hda_jack_detect(codec, spec->unsol_tag_hp) ||
+				   snd_hda_jack_detect(codec, spec->unsol_tag_front_hp);
 
-		if (jack_present)
-			spec->cur_out_type = HEADPHONE_OUT;
-		else
-			spec->cur_out_type = SPEAKER_OUT;
+			if (jack_present)
+				spec->cur_out_type = HEADPHONE_OUT;
+			else
+				spec->cur_out_type = SPEAKER_OUT;
+		}
 	} else
 		spec->cur_out_type = spec->out_enum_val;
 	if (ca0132_quirk(spec) == QUIRK_AE9)
@@ -5188,6 +5229,40 @@ static int ca0132_alt_select_out(struct hda_codec *codec)
 	}
 
 	return 0;
+}
+
+static int ca0132_alt_select_out(struct hda_codec *codec)
+{
+	struct ca0132_spec *spec = codec->spec;
+	int err;
+
+	if (ca0132_quirk(spec) != QUIRK_AE9)
+		return __ca0132_alt_select_out(codec);
+
+	CLASS(snd_hda_power_pm, pm)(codec);
+	mutex_lock(&spec->ae9_output_mutex);
+	err = __ca0132_alt_select_out(codec);
+	mutex_unlock(&spec->ae9_output_mutex);
+	return err;
+}
+
+static int ae9_select_output_locked(struct hda_codec *codec, int output)
+{
+	struct ca0132_spec *spec = codec->spec;
+	int old_output = spec->out_enum_val;
+	int old_type = spec->cur_out_type;
+	bool old_pending = spec->ae9_acm_pending_mode;
+	int err;
+
+	lockdep_assert_held(&spec->ae9_output_mutex);
+	spec->out_enum_val = output;
+	err = __ca0132_alt_select_out(codec);
+	if (err < 0) {
+		spec->out_enum_val = old_output;
+		spec->cur_out_type = old_type;
+		spec->ae9_acm_pending_mode = old_pending;
+	}
+	return err;
 }
 
 static void ca0132_unsol_hp_delayed(struct work_struct *work)
@@ -6116,7 +6191,7 @@ static int ca0132_alt_mic_boost_put(struct snd_kcontrol *kcontrol,
 static int ae5_headphone_gain_info(struct snd_kcontrol *kcontrol,
 				 struct snd_ctl_elem_info *uinfo)
 {
-	const char *sfx = " Ohms)";
+	const char *sfx = "Ohms)";
 	char namestr[SNDRV_CTL_ELEM_ID_NAME_MAXLEN];
 
 	uinfo->type = SNDRV_CTL_ELEM_TYPE_ENUMERATED;
@@ -6305,7 +6380,13 @@ static int ca0132_alt_output_select_get(struct snd_kcontrol *kcontrol,
 	struct hda_codec *codec = snd_kcontrol_chip(kcontrol);
 	struct ca0132_spec *spec = codec->spec;
 
-	ucontrol->value.enumerated.item[0] = spec->out_enum_val;
+	if (ca0132_quirk(spec) == QUIRK_AE9) {
+		mutex_lock(&spec->ae9_output_mutex);
+		ucontrol->value.enumerated.item[0] = spec->out_enum_val;
+		mutex_unlock(&spec->ae9_output_mutex);
+	} else {
+		ucontrol->value.enumerated.item[0] = spec->out_enum_val;
+	}
 	return 0;
 }
 
@@ -6323,6 +6404,21 @@ static int ca0132_alt_output_select_put(struct snd_kcontrol *kcontrol,
 
 	codec_dbg(codec, "ca0132_alt_output_select: sel=%d, preset=%s\n",
 		    sel, out_type_str[sel]);
+
+	if (ca0132_quirk(spec) == QUIRK_AE9) {
+		int err = 0;
+
+		CLASS(snd_hda_power_pm, pm)(codec);
+
+		mutex_lock(&spec->ae9_output_mutex);
+		auto_jack = spec->vnode_lswitch[VNID_HP_ASEL - VNODE_START_NID];
+		if (!auto_jack)
+			err = ae9_select_output_locked(codec, sel);
+		else
+			spec->out_enum_val = sel;
+		mutex_unlock(&spec->ae9_output_mutex);
+		return err < 0 ? err : 1;
+	}
 
 	spec->out_enum_val = sel;
 
@@ -6718,25 +6814,6 @@ static int ca0132_switch_put(struct snd_kcontrol *kcontrol,
  * ADC for input. Currently only the SBZ sets dsp capture volume level, and
  * all alternative codecs set DSP playback volume.
  */
-/* Windows CtxHda master-volume curve (.data 0x118da0): index 0..100 -> 0.01 dB.
- * One knob point = one index; the DSP gets this single attenuation and the DAC
- * amp stays at 0 dB, so the 0..99 Master level sounds like Windows' 0..100. */
-static const s16 ae9_win_vol_db100[101] = {
-	 -9000,  -6642,  -5758,  -5203,  -4798,  -4478,  -4213,  -3989,
-	 -3793,  -3619,  -3463,  -3322,  -3193,  -3074,  -2963,  -2860,
-	 -2764,  -2673,  -2588,  -2507,  -2430,  -2357,  -2287,  -2220,
-	 -2156,  -2095,  -2036,  -1979,  -1924,  -1871,  -1820,  -1771,
-	 -1723,  -1677,  -1632,  -1588,  -1545,  -1504,  -1464,  -1425,
-	 -1386,  -1349,  -1313,  -1277,  -1242,  -1208,  -1175,  -1143,
-	 -1111,  -1080,  -1049,  -1019,   -990,   -961,   -933,   -905,
-	  -878,   -851,   -825,   -799,   -773,   -748,   -724,   -700,
-	  -676,   -652,   -629,   -606,   -584,   -562,   -540,   -519,
-	  -497,   -476,   -456,   -436,   -415,   -396,   -376,   -357,
-	  -338,   -319,   -300,   -282,   -264,   -246,   -228,   -211,
-	  -193,   -176,   -159,   -143,   -126,   -110,    -93,    -77,
-	   -61,    -46,    -30,    -15,      0,
-};
-
 /* The DSP latches this module's value at stream start, so it must be at 0 dB
  * BEFORE any stream (WirePlumber's probe streams, the first Spotify stream)
  * opens the device; a stale value stays in effect until the device is closed. */
@@ -6755,33 +6832,29 @@ static void ae9_dsp_volume_unity(struct hda_codec *codec)
 	spec->ae9_dsp_vol_zeroed = true;
 }
 
-/* AE-9: Master level L (0..99) -> the Windows curve, applied where Windows
- * applies it: the DACs' own volume registers (ES9038 0x0f/0x10 for the ACM
- * headphones, SABRE9006 0x02/0x04 for the line-out), 0.5 dB per step. The
- * codec amp on nid 0x02 and the DSP output volume stay at 0 dB so the DSP
- * processes a full-scale signal, as on Windows (capture: display "-10.5" <->
- * 0x0f/0x10 = 0x15). Earlier attempts: DSP volume = latched at stream start,
- * codec amp = works but attenuates before the DSP. */
-static void ae9_master_apply(struct hda_codec *codec, long lvol, long rvol)
+/* Use the same HDA dB steps that ALSA advertises, without a second curve. */
+static int ae9_master_apply(struct snd_kcontrol *kcontrol,
+			    struct snd_ctl_elem_value *ucontrol)
 {
+	struct hda_codec *codec = snd_kcontrol_chip(kcontrol);
 	struct ca0132_spec *spec = codec->spec;
-	unsigned int widx_l = clamp(lvol, 0L, 99L) * 100 / 99;
-	unsigned int widx_r = clamp(rvol, 0L, 99L) * 100 / 99;
-	unsigned int vl = clamp(DIV_ROUND_CLOSEST(-(int)ae9_win_vol_db100[widx_l], 50), 0, 255);
-	unsigned int vr = clamp(DIV_ROUND_CLOSEST(-(int)ae9_win_vol_db100[widx_r], 50), 0, 255);
+	long *valp = ucontrol->value.integer.value;
+	int ch = get_amp_channels(kcontrol);
+	int err;
 
-	int al = clamp(90 + DIV_ROUND_CLOSEST((int)ae9_win_vol_db100[widx_l], 100), 0, 90);
-	int ar = clamp(90 + DIV_ROUND_CLOSEST((int)ae9_win_vol_db100[widx_r], 100), 0, 90);
-
-	/* Baseline: the Windows curve on the nid 0x02 DAC amp (a plain HDA verb).
-	 * The DAC-register variant (ES9038 0x0f/0x10 via the BAR2 command engine,
-	 * what Windows does) is parked until the audio path is proven stable: it
-	 * put command-engine traffic into the playback window. vl/vr kept for it. */
-	(void)vl; (void)vr;
+	CLASS(snd_hda_power, pm)(codec);
 	ae9_dsp_volume_unity(codec);
-	snd_hda_codec_amp_update(codec, 0x02, 0, HDA_OUTPUT, 0, HDA_AMP_VOLMASK, al);
-	snd_hda_codec_amp_update(codec, 0x02, 1, HDA_OUTPUT, 0, HDA_AMP_VOLMASK, ar);
-	spec->ae9_acm_disp_dirty = true;
+	guard(mutex)(&codec->control_mutex);
+	err = snd_hda_mixer_amp_volume_put(kcontrol, ucontrol);
+	/* A failed stereo put may already have changed one channel. */
+	ae9_acm_display_changed(spec);
+	if (err < 0)
+		return err;
+	if (ch & 1)
+		spec->vnode_lvol[VNID_SPK - VNODE_START_NID] = *valp++;
+	if (ch & 2)
+		spec->vnode_rvol[VNID_SPK - VNODE_START_NID] = *valp;
+	return err;
 }
 
 static void ca0132_alt_dsp_volume_put(struct hda_codec *codec, hda_nid_t nid)
@@ -6937,6 +7010,9 @@ static int ca0132_alt_volume_put(struct snd_kcontrol *kcontrol,
 		break;
 	}
 
+	if (ca0132_quirk(spec) == QUIRK_AE9 && vnid == VNID_SPK)
+		return ae9_master_apply(kcontrol, ucontrol);
+
 	/* store the left and right volume */
 	if (ch & 1) {
 		spec->vnode_lvol[vnid - VNODE_START_NID] = *valp;
@@ -6948,11 +7024,6 @@ static int ca0132_alt_volume_put(struct snd_kcontrol *kcontrol,
 	}
 
 	CLASS(snd_hda_power, pm)(codec);
-	if (ca0132_quirk(spec) == QUIRK_AE9 && vnid == VNID_SPK) {
-		ae9_master_apply(codec, spec->vnode_lvol[vnid - VNODE_START_NID],
-				 spec->vnode_rvol[vnid - VNODE_START_NID]);
-		return 1;
-	}
 	ca0132_alt_dsp_volume_put(codec, vnid);
 	guard(mutex)(&codec->control_mutex);
 	return snd_hda_mixer_amp_volume_put(kcontrol, ucontrol);
@@ -7370,6 +7441,10 @@ static const char * const ca0132_alt_follower_pfxs[] = {
 	"Front", "Surround", "Center", "LFE", NULL,
 };
 
+static const char * const ae9_follower_pfxs[] = {
+	"Headphone+LO", "Surround", "Center", "LFE", NULL,
+};
+
 /*
  * Also need special channel map, because the default one is incorrect.
  * I think this has to do with the pin for rear surround being 0x11,
@@ -7461,6 +7536,17 @@ static const struct snd_kcontrol_new desktop_mixer[] = {
 };
 
 /*
+ * The AE-9 uses the same DAC path for ACM headphones and front line-out.
+ * ACP mutes a Front switch on the headphone port; Headphone+LO is its shared
+ * output element and follows volume/mute on both ports instead.
+ */
+static const struct snd_kcontrol_new ae9_shared_mixer[] = {
+	CA0132_ALT_CODEC_VOL("Headphone+LO Playback Volume", 0x02, HDA_OUTPUT),
+	CA0132_CODEC_MUTE("Headphone+LO Playback Switch", VNID_SPK, HDA_OUTPUT),
+	{ } /* end */
+};
+
+/*
  * Same as the Sound Blaster Z, except doesn't use the alt volume for capture
  * because it doesn't set decibel levels for the DSP for capture.
  */
@@ -7482,6 +7568,15 @@ static const struct snd_kcontrol_new r3di_mixer[] = {
 	{ } /* end */
 };
 
+static void ae9_vmaster_mute_changed(void *private_data, int enabled)
+{
+	struct ca0132_spec *spec = private_data;
+
+	(void)enabled;
+	/* Refresh from the committed Master state in the ACM worker. */
+	ae9_acm_display_changed(spec);
+}
+
 static int ca0132_build_controls(struct hda_codec *codec)
 {
 	struct ca0132_spec *spec = codec->spec;
@@ -7496,17 +7591,28 @@ static int ca0132_build_controls(struct hda_codec *codec)
 	}
 	/* Setup vmaster with surround followers for desktop ca0132 devices */
 	if (ca0132_use_alt_functions(spec)) {
+		const char * const *followers = ca0132_alt_follower_pfxs;
+
+		if (ca0132_quirk(spec) == QUIRK_AE9)
+			followers = ae9_follower_pfxs;
 		snd_hda_set_vmaster_tlv(codec, spec->dacs[0], HDA_OUTPUT,
 					spec->tlv);
 		snd_hda_add_vmaster(codec, "Master Playback Volume",
-					spec->tlv, ca0132_alt_follower_pfxs,
+					spec->tlv, followers,
 					"Playback Volume", 0);
 		err = __snd_hda_add_vmaster(codec, "Master Playback Switch",
-					    NULL, ca0132_alt_follower_pfxs,
+					    NULL, followers,
 					    "Playback Switch",
 					    true, 0, &spec->vmaster_mute.sw_kctl);
 		if (err < 0)
 			return err;
+		if (ca0132_quirk(spec) == QUIRK_AE9 &&
+		    spec->vmaster_mute.sw_kctl) {
+			err = snd_ctl_add_vmaster_hook(spec->vmaster_mute.sw_kctl,
+						       ae9_vmaster_mute_changed, spec);
+			if (err < 0)
+				return err;
+		}
 	}
 
 	/* Add in and out effects controls.
@@ -7626,11 +7732,12 @@ static int ca0132_build_controls(struct hda_codec *codec)
 
 	switch (ca0132_quirk(spec)) {
 	case QUIRK_AE5:
-	case QUIRK_AE9:
 	case QUIRK_AE7:
 		err = ae5_add_headphone_gain_enum(codec);
 		if (err < 0)
 			return err;
+		fallthrough;
+	case QUIRK_AE9:
 		err = ae5_add_sound_filter_enum(codec);
 		if (err < 0)
 			return err;
@@ -7907,10 +8014,29 @@ static void init_input(struct hda_codec *codec, hda_nid_t pin, hda_nid_t adc)
 
 static void refresh_amp_caps(struct hda_codec *codec, hda_nid_t nid, int dir)
 {
+	struct ca0132_spec *spec = codec->spec;
 	unsigned int caps;
+	unsigned int steps, zero_db;
+	int i;
 
 	caps = snd_hda_param_read(codec, nid, dir == HDA_OUTPUT ?
 				  AC_PAR_AMP_OUT_CAP : AC_PAR_AMP_IN_CAP);
+	if (ca0132_quirk(spec) == QUIRK_AE9 && dir == HDA_OUTPUT) {
+		for (i = 0; i < spec->multiout.num_dacs; i++) {
+			if (nid != spec->dacs[i])
+				continue;
+			/* All volume followers must share the 0 dB ceiling. */
+			steps = (caps & AC_AMPCAP_NUM_STEPS) >>
+				AC_AMPCAP_NUM_STEPS_SHIFT;
+			zero_db = (caps & AC_AMPCAP_OFFSET) >>
+				  AC_AMPCAP_OFFSET_SHIFT;
+			if (steps > zero_db) {
+				caps &= ~AC_AMPCAP_NUM_STEPS;
+				caps |= zero_db << AC_AMPCAP_NUM_STEPS_SHIFT;
+			}
+			break;
+		}
+	}
 	snd_hda_override_amp_caps(codec, nid, dir, caps);
 }
 
@@ -9474,6 +9600,185 @@ static void ae9_automute_probe(struct hda_codec *codec)
  * Windows driver RE (reference/ctxhda-acm-analysis.md). Everything below runs
  * from the 500 ms service work (Windows' periodic ACM thread); the ALSA
  * control hooks only set flags. ---- */
+#define AE9_ACM_UI_DELAY_MS 20
+#define AE9_ACM_QUIET_MS 50
+
+enum ae9_acm_job {
+	AE9_ACM_JOB_NONE,
+	AE9_ACM_JOB_DISPLAY,
+	AE9_ACM_JOB_SERVICE,
+};
+
+/* Caller holds work_lock. UI activity must never move service_due. */
+static unsigned long ae9_acm_next_work_locked(struct ca0132_spec *spec)
+{
+	unsigned long now = jiffies, due = spec->ae9_acm_service_due;
+	unsigned long ui = spec->ae9_acm_ui_due;
+
+	if (!spec->ae9_acm_ui_pending || !READ_ONCE(ae9_acm_poll) ||
+	    !spec->ae9_acm_present || spec->ae9_acm_show_mode_ticks > 0 ||
+	    READ_ONCE(spec->ae9_acm_pending_mode) ||
+	    spec->ae9_acm_display_tx_failed)
+		return due;
+	if (time_before(ui, spec->ae9_acm_quiet_until))
+		ui = spec->ae9_acm_quiet_until;
+	if (time_before(ui, now))
+		ui = now;
+	/* Preserve a full quiet interval before the next UART service. */
+	if (time_before(ui + msecs_to_jiffies(AE9_ACM_QUIET_MS), due))
+		due = ui;
+	return due;
+}
+
+static void ae9_acm_queue_locked(struct ca0132_spec *spec)
+{
+	unsigned long now, due;
+
+	if (!spec->ae9_acm_active || spec->ae9_acm_busy)
+		return;
+	due = ae9_acm_next_work_locked(spec);
+	now = jiffies;
+	mod_delayed_work(AE9_WQ, &spec->ae9_acm_work,
+			 time_after(due, now) ? due - now : 0);
+}
+
+static void ae9_acm_display_changed(struct ca0132_spec *spec)
+{
+	unsigned long flags;
+
+	if (ca0132_quirk(spec) != QUIRK_AE9)
+		return;
+	spin_lock_irqsave(&spec->ae9_acm_work_lock, flags);
+	spec->ae9_acm_disp_dirty = true;
+	if (!spec->ae9_acm_ui_pending) {
+		spec->ae9_acm_ui_pending = true;
+		spec->ae9_acm_ui_due = jiffies +
+			msecs_to_jiffies(AE9_ACM_UI_DELAY_MS);
+	}
+	if (READ_ONCE(ae9_acm_poll))
+		ae9_acm_queue_locked(spec);
+	spin_unlock_irqrestore(&spec->ae9_acm_work_lock, flags);
+}
+
+static bool ae9_acm_take_display(struct ca0132_spec *spec)
+{
+	unsigned long flags, requested;
+	bool dirty, log;
+
+	spin_lock_irqsave(&spec->ae9_acm_work_lock, flags);
+	dirty = spec->ae9_acm_disp_dirty;
+	requested = spec->ae9_acm_ui_due -
+		msecs_to_jiffies(AE9_ACM_UI_DELAY_MS);
+	spec->ae9_acm_disp_dirty = false;
+	spec->ae9_acm_ui_pending = false;
+	log = dirty && spec->ae9_acm_refresh_log_left;
+	if (log)
+		spec->ae9_acm_refresh_log_left--;
+	spin_unlock_irqrestore(&spec->ae9_acm_work_lock, flags);
+	if (log)
+		codec_info(spec->codec, "AE-9 ACM refresh: request_wait_ms=%u\n",
+			   jiffies_to_msecs(jiffies - requested));
+	return dirty;
+}
+
+static bool ae9_acm_display_allowed(struct ca0132_spec *spec)
+{
+	unsigned long flags;
+	bool allowed;
+
+	/* ALSA state reads may sleep: recheck immediately before the UART TX. */
+	spin_lock_irqsave(&spec->ae9_acm_work_lock, flags);
+	allowed = !spec->ae9_acm_ui_only ||
+		(spec->ae9_acm_active && READ_ONCE(ae9_acm_poll) &&
+		 spec->ae9_acm_present && !spec->ae9_acm_display_tx_failed &&
+		 spec->ae9_acm_show_mode_ticks <= 0 &&
+		 !READ_ONCE(spec->ae9_acm_pending_mode) &&
+		 time_before(jiffies + msecs_to_jiffies(AE9_ACM_QUIET_MS),
+			     spec->ae9_acm_service_due));
+	spin_unlock_irqrestore(&spec->ae9_acm_work_lock, flags);
+	if (!allowed)
+		ae9_acm_display_changed(spec);
+	return allowed;
+}
+
+static void ae9_acm_start(struct ca0132_spec *spec, unsigned long delay)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&spec->ae9_acm_work_lock, flags);
+	if (!spec->ae9_acm_active && !spec->ae9_acm_removing) {
+		spec->ae9_acm_active = true;
+		spec->ae9_acm_busy = false;
+		spec->ae9_acm_ui_only = false;
+		spec->ae9_acm_service_due = jiffies + delay;
+		spec->ae9_acm_quiet_until = jiffies;
+		ae9_acm_queue_locked(spec);
+	}
+	spin_unlock_irqrestore(&spec->ae9_acm_work_lock, flags);
+}
+
+static void ae9_acm_stop(struct ca0132_spec *spec, bool removing)
+{
+	unsigned long flags;
+
+	/* Close the callback producer before cancelling the shared work item. */
+	spin_lock_irqsave(&spec->ae9_acm_work_lock, flags);
+	if (removing)
+		spec->ae9_acm_removing = true;
+	spec->ae9_acm_active = false;
+	spin_unlock_irqrestore(&spec->ae9_acm_work_lock, flags);
+	cancel_delayed_work_sync(&spec->ae9_acm_work);
+}
+
+static void ae9_acm_park(struct ca0132_spec *spec)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&spec->ae9_acm_work_lock, flags);
+	spec->ae9_acm_active = false;
+	spec->ae9_acm_busy = false;
+	spec->ae9_acm_ui_only = false;
+	spin_unlock_irqrestore(&spec->ae9_acm_work_lock, flags);
+}
+
+static enum ae9_acm_job ae9_acm_begin_work(struct ca0132_spec *spec)
+{
+	enum ae9_acm_job job = AE9_ACM_JOB_NONE;
+	unsigned long flags, now;
+
+	spin_lock_irqsave(&spec->ae9_acm_work_lock, flags);
+	now = jiffies;
+	if (spec->ae9_acm_active) {
+		if (!time_before(now, spec->ae9_acm_service_due))
+			job = AE9_ACM_JOB_SERVICE;
+		else if (!time_before(now, ae9_acm_next_work_locked(spec)))
+			job = AE9_ACM_JOB_DISPLAY;
+		if (job != AE9_ACM_JOB_NONE)
+			spec->ae9_acm_busy = true;
+		else
+			ae9_acm_queue_locked(spec);
+		spec->ae9_acm_ui_only = job == AE9_ACM_JOB_DISPLAY;
+	}
+	spin_unlock_irqrestore(&spec->ae9_acm_work_lock, flags);
+	return job;
+}
+
+static void ae9_acm_finish_work(struct ca0132_spec *spec,
+				unsigned long service_delay)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&spec->ae9_acm_work_lock, flags);
+	if (service_delay)
+		spec->ae9_acm_service_due = jiffies + service_delay;
+	spec->ae9_acm_quiet_until = jiffies +
+		msecs_to_jiffies(AE9_ACM_QUIET_MS);
+	spec->ae9_acm_busy = false;
+	spec->ae9_acm_ui_only = false;
+	ae9_acm_queue_locked(spec);
+	spin_unlock_irqrestore(&spec->ae9_acm_work_lock, flags);
+}
+
 #define AE9_U_RBR 0xc00
 #define AE9_U_THR 0xc00
 #define AE9_U_DLL 0xc00
@@ -9495,6 +9800,83 @@ static void ae9_acm_tx(struct ca0132_spec *spec, const u8 *p, int n)
 		writeb(p[i], b2 + AE9_U_THR);
 		readb(b2 + AE9_U_LCR);
 	}
+}
+
+/*
+ * Bounded TX for the periodic knob/button queries.  The generic ae9_acm_tx()
+ * keeps the maintenance/display frames on the slow LSR path; the knob and
+ * button queries use Creative's DWORD status bit 1 (TX ready), which is what
+ * Windows polls.  A broken TX must never resend a partial sysex frame, so the
+ * query is stopped until the module is reloaded.
+ *
+ * Based on s3boun3t/ae9_build (knobtx1/buttontx1).
+ */
+static bool ae9_acm_knob_tx(struct ca0132_spec *spec, const u8 *p, int n)
+{
+	void __iomem *b2 = spec->mem_base;
+	u32 status = 0;
+	int i, w;
+
+	if (ca0132_quirk(spec) != QUIRK_AE9 || spec->ae9_acm_knob_tx_failed)
+		return false;
+	for (i = 0; i < 64 && (readb(b2 + AE9_U_LSR) & 0x01); i++)
+		(void)readb(b2 + AE9_U_RBR);
+	for (i = 0; i < n; i++) {
+		for (w = 0; w < 100; w++) {
+			status = readl(b2 + AE9_U_STS);
+			if (status == ~0U)
+				goto failed;
+			if (status & 0x02)
+				break;
+			usleep_range(50, 100);
+		}
+		if (w == 100)
+			goto failed;
+		writeb(p[i], b2 + AE9_U_THR);
+		readb(b2 + AE9_U_LCR);
+	}
+	return true;
+
+failed:
+	spec->ae9_acm_knob_tx_failed = true;
+	codec_warn(spec->codec,
+		   "AE-9 ACM knob TX: FAILED sent=%d/%d status=%08x; knob polling stopped until reload\n",
+		   i, n, status);
+	return false;
+}
+
+static bool ae9_acm_button_tx(struct ca0132_spec *spec, const u8 *p, int n)
+{
+	void __iomem *b2 = spec->mem_base;
+	u32 status = 0;
+	int i, w;
+
+	if (ca0132_quirk(spec) != QUIRK_AE9 || spec->ae9_acm_button_tx_failed)
+		return false;
+	for (i = 0; i < 64 && (readb(b2 + AE9_U_LSR) & 0x01); i++)
+		(void)readb(b2 + AE9_U_RBR);
+	for (i = 0; i < n; i++) {
+		for (w = 0; w < 100; w++) {
+			status = readl(b2 + AE9_U_STS);
+			if (status == ~0U)
+				goto failed;
+			if (status & 0x02)
+				break;
+			usleep_range(50, 100);
+		}
+		if (w == 100)
+			goto failed;
+		writeb(p[i], b2 + AE9_U_THR);
+		readb(b2 + AE9_U_LCR);
+	}
+	return true;
+
+failed:
+	spec->ae9_acm_button_tx_failed = true;
+	codec_warn(spec->codec,
+		   "AE-9 ACM button TX: FAILED sent=%d/%d status=%08x; button polling stopped until reload\n",
+		   i, n, status);
+	return false;
 }
 
 static int ae9_acm_rx(struct ca0132_spec *spec, u8 *buf, int max, int first_wait_ms)
@@ -9537,7 +9919,7 @@ static void ae9_acm_setreg(struct ca0132_spec *spec, u8 reg, u8 val, u8 mask)
 	ae9_acm_cmd(spec, f, sizeof(f));
 }
 
-/* F0 83 01 <reg> F7 -> RX 6: [4] = value (Windows 0x3f494 "items"); -1 on no reply */
+/* F0 83 01 <reg> F7 -> F0 83 02 <reg> <value> F7 on ACM fw 0x019589c8. */
 static int ae9_acm_getreg(struct ca0132_spec *spec, u8 reg)
 {
 	u8 q[5] = { 0xf0, 0x83, 0x01, reg, 0xf7 };
@@ -9546,8 +9928,13 @@ static int ae9_acm_getreg(struct ca0132_spec *spec, u8 reg)
 
 	ae9_acm_tx(spec, q, sizeof(q));
 	n = ae9_acm_rx(spec, rx, 6, 100);
-	if (n < 5 || rx[0] != 0xf0)
-		return -1;
+	if (n != 6 || rx[0] != 0xf0 || rx[1] != 0x83 || rx[2] != 2 ||
+	    rx[3] != reg || rx[5] != 0xf7) {
+		codec_info(spec->codec,
+			   "AE-9 ACM: invalid register reply reg=%02x len=%d bytes=%*ph\n",
+			   reg, n, n, rx);
+		return -EIO;
+	}
 	return rx[4];
 }
 
@@ -9573,6 +9960,54 @@ static bool ae9_acm_keepalive(struct ca0132_spec *spec)
 	return n >= 8 && rx[0] == 0xf0 && rx[3];
 }
 
+/* Trial only for unacknowledged volume/mute display frames, never keepalive. */
+static void ae9_acm_display_tx(struct ca0132_spec *spec, const u8 *p, int n)
+{
+	void __iomem *b2 = spec->mem_base;
+	unsigned int waits = 0;
+	ktime_t start;
+	u32 status = 0;
+	int i, w;
+
+	if (spec->ae9_acm_display_tx_failed)
+		return;
+	start = ktime_get();
+	for (i = 0; i < 64 && (readb(b2 + AE9_U_LSR) & 0x01); i++)
+		(void)readb(b2 + AE9_U_RBR);
+	for (i = 0; i < n; i++) {
+		for (w = 0; w < 100; w++) {
+			/* CtxHdb tests bit 1 of the full DWORD at BAR2+0xc7c. */
+			status = readl(b2 + AE9_U_STS);
+			if (status == ~0U)
+				goto failed;
+			if (status & 0x02)
+				break;
+			usleep_range(50, 100);
+			waits++;
+		}
+		if (w == 100)
+			goto failed;
+		writeb(p[i], b2 + AE9_U_THR);
+		readb(b2 + AE9_U_LCR);
+	}
+	if (spec->ae9_acm_display_tx_left) {
+		spec->ae9_acm_display_tx_left--;
+		codec_info(spec->codec,
+			   "AE-9 ACM display TX: sent=%d/%d waits=%u duration_us=%lld status=%08x logs_left=%u\n",
+			   i, n, waits,
+			   (long long)ktime_us_delta(ktime_get(), start), status,
+			   spec->ae9_acm_display_tx_left);
+	}
+	return;
+
+failed:
+	/* Do not send an unready byte or retry a partially transmitted frame. */
+	spec->ae9_acm_display_tx_failed = true;
+	codec_warn(spec->codec,
+		   "AE-9 ACM display TX: FAILED sent=%d/%d waits=%u status=%08x; volume display trial stopped until reboot\n",
+		   i, n, waits, status);
+}
+
 /* F0 11 09 <8 ASCII, NUL padded> 00 F7 : display text */
 static void ae9_acm_display_frame(struct ca0132_spec *spec, const char *txt, bool wait)
 {
@@ -9583,6 +10018,8 @@ static void ae9_acm_display_frame(struct ca0132_spec *spec, const char *txt, boo
 		f[3 + i] = txt[i];
 	if (wait)
 		ae9_acm_cmd(spec, f, sizeof(f));
+	else if (ca0132_quirk(spec) == QUIRK_AE9)
+		ae9_acm_display_tx(spec, f, sizeof(f));
 	else
 		ae9_acm_tx(spec, f, sizeof(f));	/* fire and forget: volume display */
 }
@@ -9592,32 +10029,38 @@ static void ae9_acm_display(struct ca0132_spec *spec, const char *txt)
 	ae9_acm_display_frame(spec, txt, true);
 }
 
-/* 'Master Playback Volume' on the AE-9 is a virtual master whose slave is
- * 'Front'; the level the user sees/turns is the master's own value, not the
- * slave's scaled copy in vnode_lvol (using the latter as the knob's base made
- * every tick shrink the level when Front was below 100%). */
-static long ae9_master_level(struct hda_codec *codec, struct snd_kcontrol **kctlp)
+/*
+ * 'Master Playback Volume' on the AE-9 follows the shared Headphone+LO output.
+ * The level the user sees/turns is the master's own value, not the follower's
+ * scaled copy in vnode_lvol (using the latter as the knob's base made every
+ * tick shrink the level when the follower was below 100%).
+ */
+static long ae9_master_level(struct hda_codec *codec,
+			     struct snd_kcontrol **kctlp, long *max_level)
 {
-	struct ca0132_spec *spec = codec->spec;
 	struct snd_kcontrol *kctl = snd_hda_find_mixer_ctl(codec, "Master Playback Volume");
+	struct snd_ctl_elem_info info = { 0 };
 	struct snd_ctl_elem_value *uctl;
-	long v = spec->vnode_lvol[VNID_SPK - VNODE_START_NID];
+	long v;
+	int err;
 
 	if (kctlp)
 		*kctlp = kctl;
-	if (!kctl || !kctl->get)
-		return v;
+	if (!kctl || !kctl->get || !kctl->info)
+		return -ENOENT;
+	err = kctl->info(kctl, &info);
+	if (err < 0)
+		return err;
+	*max_level = info.value.integer.max;
 	uctl = kzalloc(sizeof(*uctl), GFP_KERNEL);
 	if (!uctl)
-		return v;
-	if (kctl->get(kctl, uctl) >= 0)
-		v = uctl->value.integer.value[0];
+		return -ENOMEM;
+	err = kctl->get(kctl, uctl);
+	v = err < 0 ? err : uctl->value.integer.value[0];
 	kfree(uctl);
 	return v;
 }
 
-/* Windows shows the level in dB (-90.0 .. 0.0), i.e. the Windows table value
- * for the current step, not the 0..99 index. */
 static bool ae9_master_muted(struct hda_codec *codec)
 {
 	struct snd_kcontrol *kctl = snd_hda_find_mixer_ctl(codec, "Master Playback Switch");
@@ -9637,14 +10080,36 @@ static bool ae9_master_muted(struct hda_codec *codec)
 
 static void ae9_acm_show_volume(struct ca0132_spec *spec)
 {
-	long lvl = clamp(ae9_master_level(spec->codec, NULL), 0L, 99L);
-	int db100 = -ae9_win_vol_db100[lvl * 100 / 99];	/* positive magnitude */
+	struct hda_codec *codec = spec->codec;
+	unsigned int caps;
+	int left, right, offset, step, db100;
 	char txt[9];
 
-	if (ae9_master_muted(spec->codec))
+	if (ae9_master_muted(codec)) {
 		snprintf(txt, sizeof(txt), "MUTE");
-	else
-		snprintf(txt, sizeof(txt), "%s%d.%d", db100 ? "-" : "", db100 / 100, (db100 % 100) / 10);
+	} else {
+		/* Show the louder channel after Master and follower attenuation. */
+		scoped_guard(mutex, &codec->control_mutex) {
+			left = snd_hda_codec_amp_read(codec, 0x02, 0,
+						      HDA_OUTPUT, 0);
+			right = snd_hda_codec_amp_read(codec, 0x02, 1,
+						       HDA_OUTPUT, 0);
+		}
+		caps = query_amp_caps(codec, 0x02, HDA_OUTPUT);
+		if (left < 0 || right < 0 || caps == ~0U) {
+			ae9_acm_display_changed(spec);
+			return;
+		}
+		offset = (caps & AC_AMPCAP_OFFSET) >> AC_AMPCAP_OFFSET_SHIFT;
+		step = ((caps & AC_AMPCAP_STEP_SIZE) >>
+			AC_AMPCAP_STEP_SIZE_SHIFT) + 1;
+		db100 = (max(left & HDA_AMP_VOLMASK,
+			     right & HDA_AMP_VOLMASK) - offset) * step * 25;
+		snprintf(txt, sizeof(txt), "%s%d.%d", db100 < 0 ? "-" : "",
+			 abs(db100) / 100, (abs(db100) % 100) / 10);
+	}
+	if (!ae9_acm_display_allowed(spec))
+		return;
 	ae9_acm_display_frame(spec, txt, false);
 }
 
@@ -9675,7 +10140,8 @@ static int ae9_acm_button(struct ca0132_spec *spec, int n)
 	u8 rx[8];
 	int got;
 
-	ae9_acm_tx(spec, q, sizeof(q));
+	if (!ae9_acm_button_tx(spec, q, sizeof(q)))
+		return 0;
 	got = ae9_acm_rx(spec, rx, sizeof(rx), 30);
 	if (got < 5 || rx[0] != 0xf0 || rx[3] != n || rx[4] != 1)
 		return 0;
@@ -9740,7 +10206,7 @@ static void ae9_acm_service_knob_press(struct hda_codec *codec)
 	if (ms < 1500) {
 		ae9_toggle_ctl(codec, "Master Playback Switch", false);
 		codec_info(codec, "AE-9 ACM: knob press (%d ms) -> mute toggle\n", ms);
-		spec->ae9_acm_disp_dirty = true;
+		ae9_acm_display_changed(spec);
 	} else if (ms < 3000) {
 		ae9_toggle_ctl(codec, "AE-9 Output", true);	/* select_out flags pending_mode */
 		codec_info(codec, "AE-9 ACM: knob mid press (%d ms) -> output toggle\n", ms);
@@ -9792,21 +10258,78 @@ static void ae9_acm_apply_mode(struct hda_codec *codec)
 {
 	struct ca0132_spec *spec = codec->spec;
 
+	mutex_lock(&spec->ae9_output_mutex);
+	spec->ae9_acm_pending_mode = false;
 	ae9_acm_apply_regs(spec);
 	ae9_apply_output_path(codec);
 	ae9_acm_display(spec, spec->cur_out_type == HEADPHONE_OUT ? "-HP-" : "-SP-");
 	spec->ae9_acm_show_mode_ticks = 10;
+	mutex_unlock(&spec->ae9_output_mutex);
 }
 
-/* Every 10th tick (Windows 0x3f494 reads items 2, 1, 7): verify the mode bits
- * and put them back if the module changed them on its own. Logs the drift. */
-/* Every 10th tick (Windows reads items 2/1/7 and 5/6 each tick): make sure the
- * HP-amp bit is what we set, and log the module's own selector bits when they
- * change (Windows follows them; we only report for now). */
+/*
+ * Physical 3.5 mm headphone presence is reg2 bit5, active low. Two unplug /
+ * replug trials on ACM firmware 0x019589c8 changed only this bit. The module's
+ * output-selector bits do not follow that jack. Reuse the existing output
+ * path on the first valid sample and on subsequent physical transitions;
+ * leave manual output choices alone while the jack state stays unchanged.
+ */
+static void ae9_acm_update_headphone_jack(struct hda_codec *codec, int reg2)
+{
+	struct ca0132_spec *spec = codec->spec;
+	struct snd_kcontrol *kctl;
+	bool present = !(reg2 & 0x20);
+	bool notify = false;
+	bool auto_jack;
+	int output = present ? HEADPHONE_OUT : SPEAKER_OUT;
+	int err;
+
+	if (ca0132_quirk(spec) != QUIRK_AE9)
+		return;
+
+	/* Only the ACM worker updates the physical-presence sample. */
+	if (spec->ae9_hp_jack_valid && present == spec->ae9_hp_jack_present)
+		return;
+
+	kctl = snd_hda_find_mixer_ctl(codec, "AE-9 Output");
+	if (!kctl)
+		return;
+
+	auto_jack = spec->vnode_lswitch[VNID_HP_ASEL - VNODE_START_NID];
+
+	CLASS(snd_hda_power_pm, pm)(codec);
+	mutex_lock(&spec->ae9_output_mutex);
+	spec->ae9_hp_jack_valid = true;
+	spec->ae9_hp_jack_present = present;
+	codec_info(codec, "AE-9 ACM: headphone jack %s (reg2=%02x)\n",
+		   present ? "inserted" : "removed", reg2);
+	/* Record the sample even with auto-detect off so that enabling it
+	 * follows the current jack; never move the output behind the user's
+	 * back while manual selection is active. */
+	if (!auto_jack)
+		goto out;
+	if (spec->out_enum_val == output && spec->cur_out_type == output)
+		goto out;
+
+	err = ae9_select_output_locked(codec, output);
+	if (err < 0) {
+		/* Do not retry a partially applied switch on an unchanged jack. */
+		codec_err(codec, "AE-9 ACM: jack output switch failed (%d)\n", err);
+		goto out;
+	}
+
+	notify = true;
+out:
+	mutex_unlock(&spec->ae9_output_mutex);
+	if (notify)
+		snd_ctl_notify(codec->card, SNDRV_CTL_EVENT_MASK_VALUE, &kctl->id);
+}
+
+/* Every 10th tick, verify the amp, report the selector and sample the jack. */
 static void ae9_acm_check_regs(struct hda_codec *codec)
 {
 	struct ca0132_spec *spec = codec->spec;
-	bool hp = spec->cur_out_type == HEADPHONE_OUT;
+	bool hp;
 	int r2 = ae9_acm_getreg(spec, 0x02);
 	int r7 = ae9_acm_getreg(spec, 0x07);
 	int sel;
@@ -9823,11 +10346,15 @@ static void ae9_acm_check_regs(struct hda_codec *codec)
 		spec->ae9_acm_regs_logged = true;
 		spec->ae9_acm_sel = sel;
 	}
+	mutex_lock(&spec->ae9_output_mutex);
+	hp = spec->cur_out_type == HEADPHONE_OUT;
 	if (!!(r2 & 0x40) != hp) {
 		codec_info(codec, "AE-9 ACM: HP amp bit is %s but output is %s, re-applying\n",
 			   (r2 & 0x40) ? "on" : "off", hp ? "headphone" : "speakers");
 		ae9_acm_apply_regs(spec);
 	}
+	mutex_unlock(&spec->ae9_output_mutex);
+	ae9_acm_update_headphone_jack(codec, r2);
 }
 
 static bool ae9_acm_init(struct hda_codec *codec)
@@ -9917,9 +10444,9 @@ static bool ae9_acm_init(struct hda_codec *codec)
 /* Volume knob: F0 C2 00 F7 -> RX 8: [3] dir, [4] detents, [5..6] ms (fw >= 0x01957D60).
  * Mapping decoded from CtxHda 0x3f8a8 + board 0x35298 (2026-09-08):
  *  - dir 0 = clockwise = louder, dir 1 = quieter (the board subtracts on dir 1);
- *  - detents go through an accumulator, 2 detents = 1 volume point (one index
- *    of Windows' 101-point volume table); on a direction change the remainder
- *    is dropped and a single detent counts as 2 so it moves immediately.
+ *  - detents go through an accumulator, 2 detents = 1 ALSA volume step;
+ *    on a direction change the remainder is dropped and a single detent
+ *    counts as 2 so it moves immediately.
  * Windows' ms-based acceleration (x2/x3/x4 for >4 detents per 50 ms poll) is
  * deliberately NOT applied: our poll is slower, so it fired on normal turning
  * and produced +40..+64 jumps. */
@@ -9931,9 +10458,10 @@ static void ae9_acm_knob(struct hda_codec *codec)
 	struct snd_ctl_elem_value *uctl;
 	u8 rx[8];
 	int n, dir, steps, delta;
-	long v;
+	long v, max_level;
 
-	ae9_acm_tx(spec, q, sizeof(q));
+	if (!ae9_acm_knob_tx(spec, q, sizeof(q)))
+		return;
 	n = ae9_acm_rx(spec, rx, 8, 30);
 	if (n < 5 || rx[0] != 0xf0)
 		return;
@@ -9953,20 +10481,22 @@ static void ae9_acm_knob(struct hda_codec *codec)
 	spec->ae9_acm_turbo = 10;
 	if (!delta)
 		return;
-	v = ae9_master_level(codec, &kctl);
-	v = clamp(v + delta, 0L, 99L);
-	codec_info(codec, "AE-9 ACM: knob dir=%d detents=%d -> %+d => %ld\n", dir, rx[4], delta, v);
-	if (!kctl || !kctl->put)
+	v = ae9_master_level(codec, &kctl, &max_level);
+	if (v < 0 || !kctl || !kctl->put)
 		return;
+	v = clamp(v + delta, 0L, max_level);
+	codec_info(codec, "AE-9 ACM: knob dir=%d detents=%d -> %+d => %ld\n", dir, rx[4], delta, v);
 	uctl = kzalloc(sizeof(*uctl), GFP_KERNEL);
 	if (!uctl)
 		return;
 	uctl->value.integer.value[0] = v;
 	uctl->value.integer.value[1] = v;
-	kctl->put(kctl, uctl);		/* vmaster -> Front put -> ae9_master_apply */
+	n = kctl->put(kctl, uctl);		/* vmaster -> shared output volume */
 	kfree(uctl);
+	if (n <= 0)
+		return;
 	snd_ctl_notify(codec->card, SNDRV_CTL_EVENT_MASK_VALUE, &kctl->id);
-	spec->ae9_acm_disp_dirty = true;
+	ae9_acm_display_changed(spec);
 }
 
 /* The 500 ms ACM service (Windows: thread 0x413b4; 50 ms "turbo" while the
@@ -9977,6 +10507,16 @@ static void ae9_acm_work_fn(struct work_struct *work)
 						struct ca0132_spec, ae9_acm_work);
 	struct hda_codec *codec = spec->codec;
 	bool turbo = spec->ae9_acm_turbo > 0;
+	enum ae9_acm_job job = ae9_acm_begin_work(spec);
+
+	if (job == AE9_ACM_JOB_NONE)
+		return;
+	if (job == AE9_ACM_JOB_DISPLAY) {
+		if (ae9_acm_take_display(spec))
+			ae9_acm_show_volume(spec);
+		ae9_acm_finish_work(spec, 0);
+		return;
+	}
 
 	ae9_gpio_cmd(spec, 0x0105);
 	if (!spec->ae9_acm_present) {
@@ -9985,13 +10525,16 @@ static void ae9_acm_work_fn(struct work_struct *work)
 			if (spec->ae9_acm_present && !ae9_acm_poll) {
 				ae9_acm_show_volume(spec);
 				codec_info(codec, "AE-9 ACM: initialised; service parked (ae9_acm_poll=0)\n");
+				ae9_acm_park(spec);
 				return;		/* no reschedule: quiet baseline */
 			}
 		}
 		goto out;
 	}
-	if (!ae9_acm_poll)
+	if (!ae9_acm_poll) {
+		ae9_acm_park(spec);
 		return;			/* parked at runtime via /sys/module/.../parameters */
+	}
 	spec->ae9_acm_tick++;
 	/*
 	 * While the knob is moving only the knob and the display are serviced.
@@ -10013,8 +10556,7 @@ static void ae9_acm_work_fn(struct work_struct *work)
 			spec->ae9_acm_dead_ticks = 0;
 		}
 	}
-	if (spec->ae9_acm_pending_mode) {
-		spec->ae9_acm_pending_mode = false;
+	if (READ_ONCE(spec->ae9_acm_pending_mode)) {
 		ae9_acm_apply_mode(codec);
 	} else if (!turbo && (spec->ae9_acm_tick % 10) == 0) {
 		ae9_acm_check_regs(codec);
@@ -10030,17 +10572,16 @@ static void ae9_acm_work_fn(struct work_struct *work)
 	}
 	if (spec->ae9_acm_show_mode_ticks > 0) {
 		if (--spec->ae9_acm_show_mode_ticks == 0)
-			spec->ae9_acm_disp_dirty = true;
-	} else if (spec->ae9_acm_disp_dirty) {
-		spec->ae9_acm_disp_dirty = false;
+			ae9_acm_display_changed(spec);
+	} else if (ae9_acm_take_display(spec)) {
 		ae9_acm_show_volume(spec);
 	}
 out:
 	if (spec->ae9_acm_turbo > 0) {
 		spec->ae9_acm_turbo--;
-		queue_delayed_work(AE9_WQ, &spec->ae9_acm_work, msecs_to_jiffies(50));
+		ae9_acm_finish_work(spec, msecs_to_jiffies(50));
 	} else {
-		queue_delayed_work(AE9_WQ, &spec->ae9_acm_work, msecs_to_jiffies(500));
+		ae9_acm_finish_work(spec, msecs_to_jiffies(500));
 	}
 }
 
@@ -10125,7 +10666,7 @@ static void ae9_setup_defaults(struct hda_codec *codec)
 	codec_info(codec, "AE-9: converter bring-up done (capture-based, OutFX %s)\n",
 		   spec->effects_switch[PLAY_ENHANCEMENT - EFFECT_START_NID] ? "on" : "off");
 	ae9_dump_dsp_output_state(codec, "idle after bring-up");
-	queue_delayed_work(AE9_WQ, &spec->ae9_acm_work, msecs_to_jiffies(500));
+	ae9_acm_start(spec, msecs_to_jiffies(500));
 }
 
 static void ae7_setup_defaults(struct hda_codec *codec)
@@ -11271,6 +11812,11 @@ static void ca0132_alt_init(struct hda_codec *codec)
 		 * Our RMW landed 0x20: the low 3 bits (port lanes?) were clear. */
 		chipio_read(codec, 0x18b030, &tmp);
 		chipio_write(codec, 0x18b030, 0x00000027);
+		/*
+		 * The ACM's IEM/Normal/High switch owns the gain; keep the
+		 * ES9038 trims at 0 dB like Windows does.
+		 */
+		spec->ae5_headphone_gain_val = 2;
 		break;
 	case QUIRK_AE7:
 		ca0132_gpio_init(codec);
@@ -11319,8 +11865,7 @@ static int ca0132_init(struct hda_codec *codec)
 			if (ca0132_quirk(spec) == QUIRK_SBZ)
 				sbz_dsp_startup_check(codec);
 			if (ca0132_quirk(spec) == QUIRK_AE9)
-				queue_delayed_work(AE9_WQ, &spec->ae9_acm_work,
-						      msecs_to_jiffies(500));
+				ae9_acm_start(spec, msecs_to_jiffies(500));
 			return 0;
 		}
 	}
@@ -11439,7 +11984,7 @@ static void ca0132_free(struct hda_codec *codec)
 
 	cancel_delayed_work_sync(&spec->unsol_hp_work);
 	cancel_delayed_work_sync(&spec->ae9_dump_work);
-	cancel_delayed_work_sync(&spec->ae9_acm_work);
+	ae9_acm_stop(spec, true);
 	snd_hda_power_up(codec);
 	switch (ca0132_quirk(spec)) {
 	case QUIRK_SBZ:
@@ -11815,6 +12360,8 @@ static int ca0132_codec_probe(struct hda_codec *codec,
 		return -ENOMEM;
 	codec->spec = spec;
 	spec->codec = codec;
+	mutex_init(&spec->ae9_output_mutex);
+	spin_lock_init(&spec->ae9_acm_work_lock);
 
 	/* Detect codec quirk */
 	snd_hda_pick_fixup(codec, ca0132_quirk_models, ca0132_quirks, NULL);
@@ -11865,7 +12412,10 @@ static int ca0132_codec_probe(struct hda_codec *codec,
 		snd_hda_codec_set_name(codec, "Sound BlasterX AE-5");
 		break;
 	case QUIRK_AE9:
-		spec->mixers[0] = desktop_mixer;
+		/* Replace only the Front pair; keep the other desktop controls. */
+		spec->mixers[0] = ae9_shared_mixer;
+		spec->mixers[1] = desktop_mixer + 2;
+		spec->num_mixers = 2;
 		snd_hda_codec_set_name(codec, "Sound Blaster AE-9");
 		break;
 	case QUIRK_AE7:
@@ -11903,10 +12453,18 @@ static int ca0132_codec_probe(struct hda_codec *codec,
 
 #ifdef CONFIG_PCI
 	if (spec->use_pci_mmio) {
-		spec->mem_base = pci_iomap(codec->bus->pci, 2, 0xC20);
+		unsigned long map_size = 0xc20;
+
+		/* Include the full DWORD status register on the AE-9 only. */
+		if (ca0132_quirk(spec) == QUIRK_AE9)
+			map_size = AE9_U_STS + sizeof(u32);
+		spec->mem_base = pci_iomap(codec->bus->pci, 2, map_size);
 		if (spec->mem_base == NULL) {
 			codec_warn(codec, "pci_iomap failed! Setting quirk to QUIRK_NONE.");
 			codec->fixup_id = QUIRK_NONE;
+		} else if (ca0132_quirk(spec) == QUIRK_AE9) {
+			spec->ae9_acm_display_tx_left = 32;
+			spec->ae9_acm_refresh_log_left = 32;
 		}
 	}
 #endif
@@ -11975,7 +12533,7 @@ static int ca0132_codec_suspend(struct hda_codec *codec)
 
 	cancel_delayed_work_sync(&spec->unsol_hp_work);
 	cancel_delayed_work_sync(&spec->ae9_dump_work);
-	cancel_delayed_work_sync(&spec->ae9_acm_work);
+	ae9_acm_stop(spec, false);
 	spec->ae9_acm_present = false;	/* re-probe the ACM after resume */
 	return 0;
 }
