@@ -33,7 +33,7 @@ the same meaning as the Features table below.
 | Analog out | Headphone 6.35 mm (ACM), front L/R, rear, center/sub | Working; 5.1 on jacks 13–16 |
 | Analog in | ACM 6.3 mm mic, XLR mic, rear line-in | Working |
 | XLR 48 V | Phantom power via the ACM button | Not exposed in software |
-| Optical | S/PDIF in and out | Working, 44.1–192 kHz |
+| Optical | S/PDIF in and out | Working, 44.1–192 kHz; AC3/DTS 5.1 passthrough |
 | Rates | 44.1 / 48 / 88.2 / 96 / 192 kHz | Working; **192 kHz maximum** |
 | DSP | SBX, Crystalizer, Dialog Plus, Smart Volume, X-Bass, Surround, EQ | Working |
 | Mic DSP | CrystalVoice, VoiceFX, Mic SVM, Noise Reduction | Working |
@@ -54,19 +54,19 @@ the same meaning as the Features table below.
 | ACM | Mic / line input (6.3 mm, XLR) | Working; 48 V phantom not exposed |
 | Card | Playback 44.1 / 48 / 88.2 / 96 / 192 kHz | Working (native rate with Direct Mode) |
 | Card | SBX effects, per-effect switches and levels | Working |
+| Card | ES9038Q2M oversampling filter | 7 modes, kept across output and mute |
 | Card | 5.1 analog output on jacks 13–16 (front, rear, center/sub) | Working; rear enabled through codec pin `0x11` |
 | Card | Speaker layout ↔ PipeWire profile (`2.0`…`5.1`) | Working, both directions (`ae9-profile-sync`) |
 | Card | GNOME “Headphones” / “Line Out” ↔ ACM output | Working, both directions (`ae9-profile-sync`) |
 | Card | Rear line-in / mic-in | Working (capture device 4) |
 | Card | What U Hear loopback | Working (capture device 2) |
-| Card | Optical S/PDIF out | Working, 44.1–192 kHz (loopback-tested) |
+| Card | Optical S/PDIF out | Working, 44.1–192 kHz; AC3/DTS 5.1 passthrough (bit-exact) |
 | Card | Optical S/PDIF in | Working, 44.1–192 kHz (loopback-tested) |
 | Card | Mic effects (CrystalVoice) | Working |
-| Card | Suspend / resume | Working, with the installed unmute hook |
+| Card | Suspend / resume | Working; dedicated AE-9 shutdown sequence and post-resume unmute hook |
 | Card | Direct Mode (follow the stream rate) | Working 44.1–192 kHz, opt-in |
 
-**Not supported:** 48 V phantom power, AC3/DTS passthrough, and importing a Windows
-SBX profile. The IEM/Normal/High headphone gain is handled by the 3-position switch on
+**Not supported:** 48 V phantom power and importing a Windows SBX profile. The IEM/Normal/High headphone gain is handled by the 3-position switch on
 the ACM; the driver keeps the ES9038Q2M trims at 0 dB (as Windows does) and exposes no
 duplicate software control. 384 kHz was tested and rejected (the HDA link does not
 carry the 8× rate). **192 kHz is the maximum.**
@@ -88,7 +88,8 @@ card; they are kept here so the scope is visible.
 - [x] **Desktop sync** — `Surround Channel Config` ↔ PipeWire profile, and the GNOME
       Headphones/Line Out routes ↔ the ACM `AE-9 Output` relay.
 - [x] **Direct Mode** — stream-rate following at 44.1–192 kHz, effects off, stereo.
-- [x] **Optical S/PDIF** — playback and capture at 44.1–192 kHz, loopback-tested.
+- [x] **Optical S/PDIF** — playback and capture at 44.1–192 kHz, loopback-tested;
+      AC3/DTS 5.1 passthrough after the S/PDIF tracker bypass.
 - [x] **Desktop entry** — `install.sh` installs `ae9-fx` and its application-grid entry.
 - [ ] **Upstream** — send the 24-patch series and address review.
 - [ ] **Packaging** — RPM/COPR for Fedora.
@@ -97,8 +98,6 @@ card; they are kept here so the scope is visible.
 - [ ] **`ae9ctl`** — profiles (headphones / speakers / recording) and save/restore.
 - [ ] **Docs** — man page for `ae9-fx` and `ae9ctl`.
 - [ ] **CI** — kernel-version matrix and a saved hardware selftest report.
-- [ ] **Driver** — AC3/DTS passthrough over optical S/PDIF (blocked: there is no
-      IEC958 subframe route on device 10).
 - [ ] **Driver** — import SBX profiles from the Windows package.
 - [ ] **Driver** — document the remaining ACM/DSP registers.
 
@@ -377,10 +376,28 @@ analog profile at login.
 The S/PDIF input is silent until the optical input switch is on. `ae9-defaults` turns
 it on at login, and the GUI's Output page has the same switch.
 
-**The optical link is stereo PCM.** 5.1 is available on the analog line-out, not over
-S/PDIF. AC3/DTS passthrough is not implemented: the optical PCM is plain S16/S32 and
-does not expose IEC958 subframes, so the ALSA `a52` encoder path cannot drive it.
-(Tested; `alsa-plugins-a52` was installed and removed again.)
+**The optical link carries stereo PCM and compressed AC3/DTS 5.1.** 5.1 over S/PDIF is
+not six PCM channels: it is an IEC61937 AC3 or DTS bitstream. The AE-9 secondary codec's
+S/PDIF tracker used to process/resample the stream, which preserved PCM but corrupted
+bitstreams. The driver now bypasses it (`CONTROL_FLAG_TRACKER=0`) for the AE-9, making
+the optical path bit-exact for both PCM and compressed 5.1.
+
+Verified with an optical loopback cable: a 5.1 AC3 test stream produced 282 IEC61937
+bursts and decoded to six channels with the expected 300–800 Hz tones; a DTS 5.1
+stream decodes as well. A square-wave PCM test is bit-exact at the capture converter.
+
+For passthrough use a player that sets the IEC958 non-audio bit, and prefer the raw
+ALSA device for bit-perfect output:
+
+```sh
+mpv --ao=alsa --audio-device=hw:Creative,10 \
+    --audio-spdif=ac3,dts --audio-channels=5.1 movie.mkv
+```
+
+In the GUI set **Output → S/PDIF output** on, **48000 Hz** and **S16LE**. The PipeWire
+“Sound Blaster AE-9 Optical S/PDIF” sink is fine for PCM, but a bitstream should go to
+`hw:Creative,10` directly because the adapter may resample. A 6-channel PCM file will
+not pass as 5.1 over S/PDIF; it must be AC3 or DTS.
 
 #### Loopback self-test
 
@@ -394,8 +411,9 @@ The default path uses the PipeWire adapter nodes, which is what the desktop uses
 The adapters follow the stream rate, so the link runs natively at each rate. `--raw`
 drives the ALSA devices directly and only works while PipeWire is not holding
 `hw:Creative,10`. The script turns both S/PDIF switches on, plays a 1 kHz tone, reports
-level, frequency and dropouts, then restores the switches. The DSP is in the path in
-both directions, so this checks the link and the rates, not bit-exactness.
+level, frequency and dropouts, then restores the switches. The codec path is bit-exact
+after the tracker bypass; the PipeWire adapters may still convert, so the test checks
+the link and the rates rather than bit-exactness.
 
 ### Effects (SBX)
 
@@ -471,7 +489,7 @@ No root needed.
 
 | Page | What it controls |
 |---|---|
-| **Output** | Master volume/mute, `AE-9 Output`, auto-detect, surround, S/PDIF output switch and rate/bits, DAC oversampling filter, running format, graph clock, allowed/forced rates, Direct Mode, analog bits (Auto / S32LE / S16LE) |
+| **Output** | Master volume/mute, `AE-9 Output`, auto-detect, surround, S/PDIF output switch and rate/bits, DAC oversampling filter (7 ES9038Q2M modes), running format, graph clock, allowed/forced rates, Direct Mode, analog bits (Auto / S32LE / S16LE) |
 | **Input** | Separate microphone, line-in, What U Hear and S/PDIF groups, per-input rate/bits, S/PDIF input switch, capture level/switch, mic boost, CrystalVoice and VoiceFX |
 | **SBX** | Effects master, each processor and level, 10-band EQ |
 
@@ -552,7 +570,8 @@ step, polling every 2 s:
 It also keeps the volume constant when the output switches. WirePlumber remembers a
 separate volume for every route; the service saves the level before a route change and
 re-applies it afterwards, so the ACM knob, `ae9-fx` and the GNOME panel all keep the
-same loudness.
+same loudness. A layout change made while a profile switch is still settling is queued
+and applied after the switch, so a fast 5.1 → 2.0 change is not lost.
 
 It also names every analog sink (`Sound Blaster AE-9 Output`, `… 2.1`, `… 4.0`,
 `… 4.1`, `… 5.0`, `… 5.1`) and gives it priority over the optical S/PDIF.
@@ -654,6 +673,30 @@ Check, in this order:
 If the jacks are still silent, attach `tools/collect-report.sh` output and the size
 and SHA-256 of your `ctefx-desktop.bin` to an issue.
 
+### AC3/DTS 5.1 over optical is silent or noisy
+
+- Use the raw ALSA device `hw:Creative,10`, not the card's ACP digital profile
+  (PCM device 1 is not wired to the optical port).
+- Set the S/PDIF output switch on and choose **48000 Hz / S16LE** in the GUI.
+- The player must send an AC3/DTS bitstream and set the IEC958 non-audio bit; a
+  6-channel PCM file will not work. For example:
+  `mpv --ao=alsa --audio-device=hw:Creative,10 --audio-spdif=ac3,dts`.
+- If it worked and then stopped after a reboot or suspend with an older module, the
+  S/PDIF tracker flag is back; install the current driver, which bypasses it at init.
+
+### A hand-installed module does not load
+
+`install.sh` and DKMS compress the modules the way the kernel expects. If you copy a
+module by hand, do not use plain `xz`: a CRC64 `.xz` is rejected by the module loader
+with `decompression failed with status 6`, and the codec falls back to the generic
+driver. Use the kernel's options:
+
+```sh
+xz --check=crc32 --lzma2=dict=1MiB -c snd-hda-codec-ca0132.ko \
+   > /lib/modules/$(uname -r)/extra/snd-hda-codec-ca0132.ko.xz
+depmod -a
+```
+
 ---
 
 ## Diagnostics and bug reports
@@ -708,9 +751,14 @@ tree and builds against the 7.2 headers.  The out-of-tree tree keeps a
 scoped version of the core readback because its DKMS module replaces
 `snd-hda-core` for every controller.  See `patches/README.md`.
 
-The analog 5.1 output, the pin `0x11` rear fix and the desktop sync services
-are newer than the current 24-patch series; folding them into the series is
-the next upstream step.
+The analog 5.1 work (rear pin `0x11`, SABRE mute, balanced DSP trims and
+`NO_PRESENCE` line-outs) is folded into the 24-patch series.  The S/PDIF
+tracker bypass that enables AC3/DTS passthrough is in the out-of-tree driver
+and still needs to be folded into the series.  The November 2026 audit fixes
+(complete ACM reply validation, the seven ES9038Q2M filters, the main-codec
+runtime-PM reference and the dedicated shutdown/suspend sequence) are also
+out-of-tree and not yet in the series.  The desktop sync services and the GUI
+are userspace components and are not part of the kernel series.
 
 ---
 
@@ -728,17 +776,22 @@ For readers of `patches/` and `driver/ca0132/ca0132.c` (`QUIRK_AE9`):
   resets both DACs.
 - Volume: 1 dB DAC steps with 0 dB at the top (step 90), shared by the knob, `Master`
   and `Headphone+LO`. The DSP volume stage is parked at 0 dB at bring-up.
-- Controls: `AE-9 Output` (renamed so desktop profiles cannot rewrite it), the SBX
-  master defaulting off, the output auto-detect gate and the Direct Mode switch.
+- Controls: `AE-9 Output` (renamed so desktop profiles cannot rewrite it), the seven
+  ES9038Q2M oversampling filters, the SBX master defaulting off, the output auto-detect
+  gate and the Direct Mode switch.
 - Analog 5.1: three output pairs through the DSP, with the rear line-out on codec pin
   `0x11` (the pin the AE-5/AE-7 use for the rear headphone jack), the DSP output
   trims balanced at 0 dB and the SABRE9006 muted with the headphones.
+- S/PDIF: the AE-9 secondary codec's tracker is bypassed, so the optical path is
+  bit-exact for PCM and for AC3/DTS 5.1 bitstreams.
 - Desktop: the headphone and line-out pins are marked “no presence detect”, giving
   ALSA phantom jacks so every analog profile (stereo, 2.1, 4.0, 4.1, 5.0, 5.1) stays
   available and WirePlumber can default to the active one instead of S/PDIF.
-- Robustness: codec runtime PM held (the ACM service dies in D3), ACM work rescheduled
-  on resume, DSP command-engine access serialised with a mutex, all UART waits sleep,
-  and the ACM work runs on the unbound workqueue.
+- Robustness: codec runtime PM held on the main codec only, a dedicated AE-9
+  shutdown/suspend sequence, complete ACM sysex reply validation (including `F7`
+  inside payloads), ACM work rescheduled on resume, DSP command-engine access
+  serialised with a mutex, all UART waits sleep, and the ACM work runs on the
+  unbound workqueue.
 - HDA core: `patches/0001` flushes posted writes around the command-ring setup;
   without it the stock core hard-locks this controller.
 
@@ -765,9 +818,10 @@ The original driver project this tree is based on is
 **[`verzic/sb-ae9`](https://github.com/verzic/sb-ae9)** — the out-of-tree AE-9
 driver, its HDA-core fix and the initial packaging.
 
-The AE-9 changes in this branch were authored and tested on the same hardware by
-**s3boun3t** and are ported from
-[`s3boun3t/ae9_build`](https://github.com/s3boun3t/ae9_build) (GPL-2.0):
+The AE-9 changes in this branch were authored by **s3boun3t** and are ported from
+[`s3boun3t/ae9_build`](https://github.com/s3boun3t/ae9_build) (GPL-2.0). The earlier
+ports were also tested by the author on the same hardware; the November 2026 audit
+round was validated upstream by build and simulation and is hardware-tested here.
 
 | Upstream commit | Change |
 |---|---|
@@ -778,10 +832,23 @@ The AE-9 changes in this branch were authored and tested on the same hardware by
 | `da1e462` | align the hardware gain and the ACM volume display |
 | `bb23212` | refresh the ACM display on mixer changes |
 
+The November 2026 audit round adds:
+
+| Upstream commit | Change |
+|---|---|
+| `8c2666b` | keep the AE-9 runtime-PM reference on the main codec only |
+| `2358f0b` | validate complete ACM replies and allow `F7` inside payloads |
+| `ffd63a4` | expose the seven ES9038Q2M filters and keep the choice across mute/output |
+| `8ed70b9` | dedicated AE-9 shutdown/suspend sequence instead of the AE-5 one |
+
 This tree adapts the ports to its own packaging: the auto-detect switch gates the jack
 switching, and the install scripts, GUI and documentation use the shared
 `Headphone+LO` control. Reviewed but deliberately not taken: `aef878a` (XanMod-specific
 multiout ABI) and `0b2ce68` (enable mic/capture by default; kept opt-in for safety).
+
+Not taken in this round: `eef0231`, `d95c164` (opt-in clock diagnostics), `f246a4c`,
+`127d131`, `5555261` (comment and table refactors), and `29e45e5` (DSP error
+propagation; deferred until it can be hardware-tested).
 
 The base driver is the Linux kernel's `snd-hda-codec-ca0132`. Prior art: the
 `ae9_build` project, which documented the card and the Windows registry; this work
